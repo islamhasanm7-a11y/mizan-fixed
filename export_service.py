@@ -662,6 +662,43 @@ class PrintTemplateService:
     """توليد قوالب الطباعة الرسمية للفواتير والإشعارات الضريبية والسندات ومسير الرواتب والتسوية البنكية"""
 
     @staticmethod
+    def generate_audit_log_pdf_summary(
+        db: Session,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None,
+        user_filter: Optional[str] = None,
+        transaction_type: Optional[str] = None,
+        table_name: Optional[str] = None,
+        action: Optional[str] = None,
+        search_query: Optional[str] = None,
+        min_amount: Optional[float] = None,
+        only_modifications: bool = False,
+        requesting_user: Optional[Any] = None,
+        auditor_notes: Optional[str] = None,
+        limit: int = 1000,
+    ) -> bytes:
+        """
+        توليد تقرير ملخص بصيغة PDF مؤمّنة وغير قابلة للتعديل لسجلات التدقيق الرقابي،
+        مشتملة على بصمة التشفير (SHA-256 Integrity Hash) لكل سجل وفق متطلبات الامتثال لهيئة الزكاة والضريبة والجمارك (ZATCA).
+        """
+        from ledger_service import LedgerService
+        return LedgerService.generate_audit_log_pdf_summary(
+            db=db,
+            start_date=start_date,
+            end_date=end_date,
+            user_filter=user_filter,
+            transaction_type=transaction_type,
+            table_name=table_name,
+            action=action,
+            search_query=search_query,
+            min_amount=min_amount,
+            only_modifications=only_modifications,
+            requesting_user=requesting_user,
+            auditor_notes=auditor_notes,
+            limit=limit,
+        )
+
+    @staticmethod
     def generate_sales_invoice_html(
         invoice: SalesInvoice,
         settings: Optional[CompanySettings] = None
@@ -1201,4 +1238,218 @@ class PrintTemplateService:
         """توليد قالب المعاينة والطباعة الرسمي لسجل التدقيق الرقابي للمراجع الخارجي"""
         from zatca_audit_pdf import ZATCAAuditPDFExporter
         return ZATCAAuditPDFExporter.generate_printable_audit_html(db=db, **kwargs)
+
+
+class CSVExportService:
+    """
+    محرك تصدير البيانات المالية والرقابية وميزان المراجعة بصيغة CSV القياسية
+    (Unmerged Tabular CSV with UTF-8-SIG encoding for Excel, Google Sheets, PowerBI & Pandas)
+    """
+
+    @staticmethod
+    def generate_trial_balance_csv(
+        tb_df: pd.DataFrame,
+        company_name: str = "شركة ميزان برو التجارية",
+        period_label: str = ""
+    ) -> bytes:
+        """تصدير ميزان المراجعة بصيغة CSV غير مدمجة مع دقة عشرية كاملة وترميز UTF-8-SIG"""
+        if tb_df is None or tb_df.empty:
+            out_df = pd.DataFrame(columns=[
+                "كود الحساب", "اسم الحساب", "النوع الرئيسي", "النوع الفرعي",
+                "مدين أول المدة", "دائن أول المدة", "حركة مدين", "حركة دائن",
+                "مدين آخر المدة", "دائن آخر المدة", "صافي الرصيد"
+            ])
+            return out_df.to_csv(index=False).encode("utf-8-sig")
+
+        export_df = tb_df.copy()
+        col_rename_map = {
+            "Account Code": "كود الحساب",
+            "Account Name": "اسم الحساب",
+            "Account Name EN": "اسم الحساب بالإنجليزية",
+            "Account Type": "النوع الرئيسي",
+            "Account SubType": "النوع الفرعي",
+            "Natural Balance": "طبيعة الحساب",
+            "Opening Debit": "مدين أول المدة",
+            "Opening Credit": "دائن أول المدة",
+            "Period Debit": "حركة مدين",
+            "Period Credit": "حركة دائن",
+            "Closing Debit": "مدين آخر المدة",
+            "Closing Credit": "دائن آخر المدة",
+            "Net Balance": "صافي الرصيد",
+        }
+        export_df = export_df.rename(columns=col_rename_map)
+
+        for col in ["مدين أول المدة", "دائن أول المدة", "حركة مدين", "حركة دائن", "مدين آخر المدة", "دائن آخر المدة", "صافي الرصيد"]:
+            if col in export_df.columns:
+                export_df[col] = pd.to_numeric(export_df[col], errors="coerce").fillna(0.0).round(2)
+
+        csv_str = export_df.to_csv(index=False)
+        return csv_str.encode("utf-8-sig")
+
+    @staticmethod
+    def generate_financial_statements_csv(
+        report: Dict[str, Any],
+        company_name: str = "شركة ميزان برو التجارية",
+        tb_df: Optional[pd.DataFrame] = None
+    ) -> bytes:
+        """
+        تصدير القوائم المالية المعتمدة (قائمة الدخل، المركز المالي، التدفقات النقدية، الزكاة، وضريبة القيمة المضافة)
+        في جدول بيانات مسطح وغير مدمج (Unmerged Flat Tabular Data) مهيأ فوراً للتحليل والجداول المحورية (Pivot Tables)
+        """
+        rows: List[Dict[str, Any]] = []
+        pnl = report.get("income_statement", {})
+        bs = report.get("balance_sheet", {})
+        cf = report.get("cash_flow_statement", {})
+        vat = report.get("vat_return", {})
+        zakat = report.get("zakat_declaration", {})
+
+        # 1. قائمة الدخل
+        pnl_label = pnl.get("period_label_ar", "الفترة المالية")
+        rows.append({"القائمة المالية": "قائمة الدخل", "القسم": "الإيرادات", "كود/رقم البند": "REV-01", "البند المحاسبي": "إجمالي المبيعات والإيرادات", "المبلغ بالريال (SAR)": round(float(pnl.get("gross_sales", 0.0)), 2), "ملاحظات وتفاصيل": pnl_label})
+        rows.append({"القائمة المالية": "قائمة الدخل", "القسم": "الإيرادات", "كود/رقم البند": "REV-02", "البند المحاسبي": "يخصم: مردودات المبيعات والخصم المسموح به", "المبلغ بالريال (SAR)": round(-float(pnl.get("sales_returns", 0.0) + pnl.get("sales_discounts", 0.0)), 2), "ملاحظات وتفاصيل": "حركة الفترة"})
+        rows.append({"القائمة المالية": "قائمة الدخل", "القسم": "الإيرادات", "كود/رقم البند": "REV-03", "البند المحاسبي": "صافي الإيرادات التشغيلية", "المبلغ بالريال (SAR)": round(float(pnl.get("net_revenue", 0.0)), 2), "ملاحظات وتفاصيل": "المبيعات ناقصاً المردودات والخصومات"})
+        rows.append({"القائمة المالية": "قائمة الدخل", "القسم": "تكلفة النشاط", "كود/رقم البند": "COS-01", "البند المحاسبي": "تكلفة البضاعة المباعة (COGS)", "المبلغ بالريال (SAR)": round(-float(pnl.get("cost_of_sales", 0.0)), 2), "ملاحظات وتفاصيل": "حركة تكلفة المبيعات"})
+        rows.append({"القائمة المالية": "قائمة الدخل", "القسم": "مجمل الربح", "كود/رقم البند": "GP-01", "البند المحاسبي": "مجمل الربح / (الخسارة)", "المبلغ بالريال (SAR)": round(float(pnl.get("gross_profit", 0.0)), 2), "ملاحظات وتفاصيل": "صافي الإيرادات ناقصاً التكلفة"})
+        rows.append({"القائمة المالية": "قائمة الدخل", "القسم": "المصروفات التشغيلية", "كود/رقم البند": "OPEX-01", "البند المحاسبي": "إجمالي المصروفات التشغيلية والإدارية", "المبلغ بالريال (SAR)": round(-float(pnl.get("operating_expenses", {}).get("total", 0.0)), 2), "ملاحظات وتفاصيل": "المصاريف الإدارية والعمومية والبيعية"})
+        rows.append({"القائمة المالية": "قائمة الدخل", "القسم": "الربح التشغيلي", "كود/رقم البند": "EBIT-01", "البند المحاسبي": "الربح التشغيلي (EBIT)", "المبلغ بالريال (SAR)": round(float(pnl.get("operating_profit", 0.0)), 2), "ملاحظات وتفاصيل": "قبل الإيرادات التمويلية والزكاة"})
+        rows.append({"القائمة المالية": "قائمة الدخل", "القسم": "أخرى والتمويل", "كود/رقم البند": "OTH-01", "البند المحاسبي": "الإيرادات الأخرى ناقصاً تكاليف التمويل", "المبلغ بالريال (SAR)": round(float(pnl.get("other_income", 0.0) - pnl.get("finance_costs", 0.0)), 2), "ملاحظات وتفاصيل": "صافي الدخل غير التشغيلي"})
+        rows.append({"القائمة المالية": "قائمة الدخل", "القسم": "صافي الدخل قبل الزكاة", "كود/رقم البند": "EBT-01", "البند المحاسبي": "صافي الربح قبل الزكاة الشرعية", "المبلغ بالريال (SAR)": round(float(pnl.get("profit_before_zakat", 0.0)), 2), "ملاحظات وتفاصيل": "أساس حساب الوعاء الزكوي"})
+        rows.append({"القائمة المالية": "قائمة الدخل", "القسم": "الزكاة", "كود/رقم البند": "ZAK-01", "البند المحاسبي": "مخصص الزكاة الشرعية التقديرية", "المبلغ بالريال (SAR)": round(-float(pnl.get("zakat_expense", 0.0)), 2), "ملاحظات وتفاصيل": "مصروف الفترة"})
+        rows.append({"القائمة المالية": "قائمة الدخل", "القسم": "صافي الربح النهائي", "كود/رقم البند": "NP-01", "البند المحاسبي": "صافي ربح / (خسارة) الفترة", "المبلغ بالريال (SAR)": round(float(pnl.get("net_profit", 0.0)), 2), "ملاحظات وتفاصيل": "الرقم المحول لحقوق الملكية"})
+
+        # 2. المركز المالي (الميزانية العمومية)
+        ca = bs.get("current_assets", {})
+        nca = bs.get("non_current_assets", {})
+        cl = bs.get("current_liabilities", {})
+        ncl = bs.get("non_current_liabilities", {})
+        eq = bs.get("equity", {})
+
+        rows.append({"القائمة المالية": "قائمة المركز المالي", "القسم": "الأصول المتداولة", "كود/رقم البند": "CA-01", "البند المحاسبي": "النقدية وما في حكمها بالبنوك والصناديق", "المبلغ بالريال (SAR)": round(float(ca.get("cash_and_equivalents", 0.0)), 2), "ملاحظات وتفاصيل": "نقدية وبنوك"})
+        rows.append({"القائمة المالية": "قائمة المركز المالي", "القسم": "الأصول المتداولة", "كود/رقم البند": "CA-02", "البند المحاسبي": "صافي الذمم المدينة التجارية (العملاء)", "المبلغ بالريال (SAR)": round(float(ca.get("net_trade_receivables", 0.0)), 2), "ملاحظات وتفاصيل": "بعد خصم مخصص الديون"})
+        rows.append({"القائمة المالية": "قائمة المركز المالي", "القسم": "الأصول المتداولة", "كود/رقم البند": "CA-03", "البند المحاسبي": "المخزون السلعي (بالمتوسط المرجح WAC)", "المبلغ بالريال (SAR)": round(float(ca.get("inventory", 0.0)), 2), "ملاحظات وتفاصيل": "تقييم المخزون المستمر"})
+        rows.append({"القائمة المالية": "قائمة المركز المالي", "القسم": "الأصول المتداولة", "كود/رقم البند": "CA-04", "البند المحاسبي": "مصروفات مدفوعة مقدماً وضريبة مدخلات", "المبلغ بالريال (SAR)": round(float(ca.get("prepaid_and_other", 0.0)), 2), "ملاحظات وتفاصيل": "أرصدة مدينة أخرى"})
+        rows.append({"القائمة المالية": "قائمة المركز المالي", "القسم": "الأصول المتداولة", "كود/رقم البند": "CA-TOT", "البند المحاسبي": "إجمالي الأصول المتداولة", "المبلغ بالريال (SAR)": round(float(ca.get("total", 0.0)), 2), "ملاحظات وتفاصيل": "مجموع الأصول المتداولة"})
+
+        rows.append({"القائمة المالية": "قائمة المركز المالي", "القسم": "الأصول غير المتداولة", "كود/رقم البند": "NCA-01", "البند المحاسبي": "صافي العقارات والآلات والمعدات (الأصول الثابتة)", "المبلغ بالريال (SAR)": round(float(nca.get("net_ppe", 0.0)), 2), "ملاحظات وتفاصيل": "التكلفة التاريخية ناقصاً مجمع الإهلاك"})
+        rows.append({"القائمة المالية": "قائمة المركز المالي", "القسم": "الأصول غير المتداولة", "كود/رقم البند": "NCA-TOT", "البند المحاسبي": "إجمالي الأصول غير المتداولة", "المبلغ بالريال (SAR)": round(float(nca.get("total", 0.0)), 2), "ملاحظات وتفاصيل": "مجموع الأصول غير المتداولة"})
+        rows.append({"القائمة المالية": "قائمة المركز المالي", "القسم": "إجمالي الأصول", "كود/رقم البند": "ASSETS-TOT", "البند المحاسبي": "إجمالي الأصول (الموجودات)", "المبلغ بالريال (SAR)": round(float(bs.get("total_assets", 0.0)), 2), "ملاحظات وتفاصيل": "متطابق مع ميزان المراجعة"})
+
+        rows.append({"القائمة المالية": "قائمة المركز المالي", "القسم": "الالتزامات المتداولة", "كود/رقم البند": "CL-01", "البند المحاسبي": "ذمم دائنة تجارية (الموردون)", "المبلغ بالريال (SAR)": round(float(cl.get("trade_payables", 0.0)), 2), "ملاحظات وتفاصيل": "أرصدة الموردين"})
+        rows.append({"القائمة المالية": "قائمة المركز المالي", "القسم": "الالتزامات المتداولة", "كود/رقم البند": "CL-02", "البند المحاسبي": "مستحقات ضريبة القيمة المضافة والزكاة ومصروفات مستحقة", "المبلغ بالريال (SAR)": round(float(cl.get("accrued_expenses_and_vat", 0.0)), 2), "ملاحظات وتفاصيل": "أرصدة دائنة أخرى"})
+        rows.append({"القائمة المالية": "قائمة المركز المالي", "القسم": "الالتزامات المتداولة", "كود/رقم البند": "CL-TOT", "البند المحاسبي": "إجمالي الالتزامات المتداولة", "المبلغ بالريال (SAR)": round(float(cl.get("total", 0.0)), 2), "ملاحظات وتفاصيل": "مجموع المطلوبات المتداولة"})
+
+        rows.append({"القائمة المالية": "قائمة المركز المالي", "القسم": "الالتزامات غير المتداولة", "كود/رقم البند": "NCL-01", "البند المحاسبي": "مخصص مكافأة نهاية الخدمة والقروض طويلة الأجل", "المبلغ بالريال (SAR)": round(float(ncl.get("total", 0.0)), 2), "ملاحظات وتفاصيل": "مطلوبات طويلة الأجل"})
+
+        rows.append({"القائمة المالية": "قائمة المركز المالي", "القسم": "حقوق الملكية", "كود/رقم البند": "EQ-01", "البند المحاسبي": "رأس المال المدفوع", "المبلغ بالريال (SAR)": round(float(eq.get("paid_up_capital", 0.0)), 2), "ملاحظات وتفاصيل": "رأس المال المسجل"})
+        rows.append({"القائمة المالية": "قائمة المركز المالي", "القسم": "حقوق الملكية", "كود/رقم البند": "EQ-02", "البند المحاسبي": "الاحتياطي النظامي", "المبلغ بالريال (SAR)": round(float(eq.get("statutory_reserve", 0.0)), 2), "ملاحظات وتفاصيل": "الاحتياطيات المتراكمة"})
+        rows.append({"القائمة المالية": "قائمة المركز المالي", "القسم": "حقوق الملكية", "كود/رقم البند": "EQ-03", "البند المحاسبي": "أرباح مبقاة أول المدة", "المبلغ بالريال (SAR)": round(float(eq.get("retained_earnings_opening", 0.0)), 2), "ملاحظات وتفاصيل": "الرصيد الافتتاحي"})
+        rows.append({"القائمة المالية": "قائمة المركز المالي", "القسم": "حقوق الملكية", "كود/رقم البند": "EQ-04", "البند المحاسبي": "صافي ربح / (خسارة) الفترة الحالية", "المبلغ بالريال (SAR)": round(float(eq.get("period_net_profit", 0.0)), 2), "ملاحظات وتفاصيل": "نتيجة قائمة الدخل"})
+        rows.append({"القائمة المالية": "قائمة المركز المالي", "القسم": "حقوق الملكية", "كود/رقم البند": "EQ-TOT", "البند المحاسبي": "إجمالي حقوق الملكية", "المبلغ بالريال (SAR)": round(float(eq.get("total", 0.0)), 2), "ملاحظات وتفاصيل": "مجموع حقوق الملكية"})
+        rows.append({"القائمة المالية": "قائمة المركز المالي", "القسم": "الإجمالي العام", "كود/رقم البند": "LIAB-EQ-TOT", "البند المحاسبي": "إجمالي الالتزامات وحقوق الملكية", "المبلغ بالريال (SAR)": round(float(bs.get("total_liabilities_and_equity", 0.0)), 2), "ملاحظات وتفاصيل": "توازن الميزانية: " + ("متزنة 100% ✅" if bs.get("is_balanced") else "غير متزنة ⚠️")})
+
+        # 3. التدفقات النقدية
+        op_act = cf.get("operating_activities", {})
+        inv_act = cf.get("investing_activities", {})
+        fin_act = cf.get("financing_activities", {})
+        rows.append({"القائمة المالية": "قائمة التدفقات النقدية", "القسم": "الأنشطة التشغيلية", "كود/رقم البند": "CF-OP-01", "البند المحاسبي": "صافي التدفق النقدي من الأنشطة التشغيلية", "المبلغ بالريال (SAR)": round(float(op_act.get("net_cash_from_operating", 0.0)), 2), "ملاحظات وتفاصيل": "التشغيل ورأس المال العامل"})
+        rows.append({"القائمة المالية": "قائمة التدفقات النقدية", "القسم": "الأنشطة الاستثمارية", "كود/رقم البند": "CF-INV-01", "البند المحاسبي": "صافي التدفق النقدي من الأنشطة الاستثمارية", "المبلغ بالريال (SAR)": round(float(inv_act.get("net_cash_used_in_investing", 0.0)), 2), "ملاحظات وتفاصيل": "النفقات الرأسمالية Capex"})
+        rows.append({"القائمة المالية": "قائمة التدفقات النقدية", "القسم": "الأنشطة التمويلية", "كود/رقم البند": "CF-FIN-01", "البند المحاسبي": "صافي التدفق النقدي من الأنشطة التمويلية", "المبلغ بالريال (SAR)": round(float(fin_act.get("net_cash_from_financing", 0.0)), 2), "ملاحظات وتفاصيل": "الشركاء والتمويل"})
+        rows.append({"القائمة المالية": "قائمة التدفقات النقدية", "القسم": "صافي التغير", "كود/رقم البند": "CF-NET-01", "البند المحاسبي": "صافي التغير في النقدية خلال الفترة", "المبلغ بالريال (SAR)": round(float(cf.get("net_change_in_cash", 0.0)), 2), "ملاحظات وتفاصيل": "مجموع الأنشطة الثلاث"})
+        rows.append({"القائمة المالية": "قائمة التدفقات النقدية", "القسم": "الأرصدة النقدية", "كود/رقم البند": "CF-CASH-END", "البند المحاسبي": "رصيد النقدية وما في حكمها نهاية الفترة", "المبلغ بالريال (SAR)": round(float(cf.get("closing_cash_balance", 0.0)), 2), "ملاحظات وتفاصيل": "مطابقة الدفاتر: " + ("متطابقة ✅" if cf.get("is_reconciled") else "يوجد فرق ⚠️")})
+
+        # 4. إقرار ضريبة القيمة المضافة
+        b1 = vat.get("box_1_std_sales", {})
+        b7 = vat.get("box_7_std_purchases", {})
+        rows.append({"القائمة المالية": "إقرار ضريبة القيمة المضافة", "القسم": "المبيعات الخاضعة للنسبة الأساسية", "كود/رقم البند": "VAT-BOX-1", "البند المحاسبي": b1.get("label", "المبيعات الخاضعة لضريبة 15%"), "المبلغ بالريال (SAR)": round(float(b1.get("taxable_amount", 0.0)), 2), "ملاحظات وتفاصيل": f"الضريبة المحصلة: {round(float(b1.get('vat_amount', 0.0)), 2):,.2f} ريال"})
+        rows.append({"القائمة المالية": "إقرار ضريبة القيمة المضافة", "القسم": "المشتريات الخاضعة للنسبة الأساسية", "كود/رقم البند": "VAT-BOX-7", "البند المحاسبي": b7.get("label", "المشتريات الخاضعة لضريبة 15%"), "المبلغ بالريال (SAR)": round(float(b7.get("taxable_amount", 0.0)), 2), "ملاحظات وتفاصيل": f"ضريبة المدخلات القابلة للاسترداد: {round(float(b7.get('recoverable_vat', 0.0)), 2):,.2f} ريال"})
+        rows.append({"القائمة المالية": "إقرار ضريبة القيمة المضافة", "القسم": "صافي الضريبة", "كود/رقم البند": "VAT-NET", "البند المحاسبي": "صافي ضريبة القيمة المضافة المستحقة للسداد / (الاسترداد)", "المبلغ بالريال (SAR)": round(float(vat.get("net_vat_due", 0.0)), 2), "ملاحظات وتفاصيل": "حركة الفترة المعتمدة"})
+
+        # 5. إقرار الزكاة الشرعية
+        rows.append({"القائمة المالية": "إقرار الزكاة الشرعية", "القسم": "الإضافات للوعاء", "كود/رقم البند": "ZAK-ADD", "البند المحاسبي": "إجمالي الإضافات للوعاء الزكوي", "المبلغ بالريال (SAR)": round(float(zakat.get("additions_to_zakat_base", {}).get("total_additions", 0.0)), 2), "ملاحظات وتفاصيل": "رأس المال والاحتياطيات والأرباح"})
+        rows.append({"القائمة المالية": "إقرار الزكاة الشرعية", "القسم": "الحسميات من الوعاء", "كود/رقم البند": "ZAK-DED", "البند المحاسبي": "إجمالي الحسميات من الوعاء الزكوي", "المبلغ بالريال (SAR)": round(-float(zakat.get("deductions_from_zakat_base", {}).get("total_deductions", 0.0)), 2), "ملاحظات وتفاصيل": "صافي الأصول الثابتة وقطع الغيار"})
+        rows.append({"القائمة المالية": "إقرار الزكاة الشرعية", "القسم": "الوعاء الزكوي", "كود/رقم البند": "ZAK-BASE", "البند المحاسبي": "الوعاء الزكوي الصافي التقديري", "المبلغ بالريال (SAR)": round(float(zakat.get("zakat_base", 0.0)), 2), "ملاحظات وتفاصيل": "الوعاء الخاضع للزكاة"})
+        rows.append({"القائمة المالية": "إقرار الزكاة الشرعية", "القسم": "الزكاة المستحقة", "كود/رقم البند": "ZAK-DUE", "البند المحاسبي": "مقدار الزكاة الشرعية المستحقة (2.5%)", "المبلغ بالريال (SAR)": round(float(zakat.get("zakat_due", 0.0)), 2), "ملاحظات وتفاصيل": "الواجب سداده لزاتكا"})
+
+        df = pd.DataFrame(rows)
+        return df.to_csv(index=False).encode("utf-8-sig")
+
+    @staticmethod
+    def generate_general_ledger_csv(
+        db: Session,
+        fiscal_year: Optional[int] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None
+    ) -> bytes:
+        """تصدير دفتر الأستاذ العام والقيود المحاسبية بصيغة CSV غير مدمجة ومفصلة للمراجع الخارجي"""
+        from models import EntryStatus, JournalEntry
+        q_entries = db.query(JournalEntry).filter(JournalEntry.status != EntryStatus.DRAFT)
+        if start_date:
+            q_entries = q_entries.filter(JournalEntry.entry_date >= start_date)
+        if end_date:
+            q_entries = q_entries.filter(JournalEntry.entry_date <= end_date)
+        entries = q_entries.order_by(JournalEntry.entry_date, JournalEntry.id).all()
+
+        rows: List[Dict[str, Any]] = []
+        for entry in entries:
+            for line in entry.lines:
+                rows.append({
+                    "رقم القيد": entry.entry_number,
+                    "تاريخ القيد": entry.entry_date.strftime("%Y-%m-%d"),
+                    "نوع المستند": entry.doc_type.value,
+                    "المرجع": entry.reference or "",
+                    "كود الحساب": line.account.code if line.account else "",
+                    "اسم الحساب": line.account.name_ar if line.account else "",
+                    "مدين (ريال)": round(float(line.debit or 0.0), 2),
+                    "دائن (ريال)": round(float(line.credit or 0.0), 2),
+                    "مركز التكلفة": line.cost_center.name_ar if line.cost_center else "",
+                    "البيان والشرح": line.description or entry.description or "",
+                    "الحالة": entry.status.value,
+                })
+
+        df = pd.DataFrame(rows)
+        if df.empty:
+            df = pd.DataFrame(columns=[
+                "رقم القيد", "تاريخ القيد", "نوع المستند", "المرجع",
+                "كود الحساب", "اسم الحساب", "مدين (ريال)", "دائن (ريال)",
+                "مركز التكلفة", "البيان والشرح", "الحالة"
+            ])
+        return df.to_csv(index=False).encode("utf-8-sig")
+
+    @staticmethod
+    def generate_audit_log_pdf_summary(
+        db: Session,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None,
+        user_filter: Optional[str] = None,
+        transaction_type: Optional[str] = None,
+        table_name: Optional[str] = None,
+        action: Optional[str] = None,
+        search_query: Optional[str] = None,
+        min_amount: Optional[float] = None,
+        only_modifications: bool = False,
+        requesting_user: Optional[Any] = None,
+        auditor_notes: Optional[str] = None,
+        limit: int = 1000,
+    ) -> bytes:
+        """
+        توليد تقرير ملخص بصيغة PDF مؤمّنة وغير قابلة للتعديل لسجلات التدقيق الرقابي،
+        مشتملة على بصمة التشفير (SHA-256 Integrity Hash) لكل سجل وفق متطلبات الامتثال لهيئة الزكاة والضريبة والجمارك (ZATCA).
+        """
+        from ledger_service import LedgerService
+        return LedgerService.generate_audit_log_pdf_summary(
+            db=db,
+            start_date=start_date,
+            end_date=end_date,
+            user_filter=user_filter,
+            transaction_type=transaction_type,
+            table_name=table_name,
+            action=action,
+            search_query=search_query,
+            min_amount=min_amount,
+            only_modifications=only_modifications,
+            requesting_user=requesting_user,
+            auditor_notes=auditor_notes,
+            limit=limit,
+        )
+
 

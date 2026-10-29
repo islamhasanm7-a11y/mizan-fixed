@@ -180,7 +180,7 @@ import json
 from seed_coa import init_database_and_seed, get_initial_admin_bootstrap_pin
 from ledger_service import LedgerService, LedgerValidationError
 from financial_engine import FinancialStatementsEngine, ExportService
-from export_service import ExcelExportService, PrintTemplateService
+from export_service import ExcelExportService, PrintTemplateService, CSVExportService
 from tb_analyzer_service import ExternalTBAnalyzerService, CPA_CATEGORIES, AUDIT_OPINION_TYPES
 from google_drive_service import GoogleDriveService, SCOPES as GOOGLE_DRIVE_SCOPES
 from zatca_phase2_validator import ZATCAPhase2Validator, ZATCA_TLV_TAG_SPECS
@@ -190,6 +190,61 @@ from zatca_qr_tlv import (
     format_zatca_timestamp,
     generate_zatca_tlv_qr_base64,
 )
+from recharts_audit_dashboard import (
+    aggregate_audit_logs_for_recharts,
+    generate_recharts_dashboard_html,
+    aggregate_executive_summary_data,
+    generate_executive_summary_recharts_html,
+    render_executive_summary_recharts_module,
+)
+from zatca_grounding_service import (
+    ZATCAGroundingService,
+    ZATCA_TOPICS,
+)
+from audit_notification_service import (
+    SuspiciousAuditAlertService,
+    AuditReportSchedulerService,
+    render_suspicious_audit_alert_ui,
+    render_audit_report_scheduler_ui,
+)
+from audit_template_service import (
+    AuditTemplateService,
+    AVAILABLE_AUDIT_FIELDS,
+    REGULATORY_BODIES,
+    render_audit_template_manager_ui,
+)
+from system_activity_service import (
+    SystemActivityService,
+    render_system_activity_module,
+    CONFIG_CATEGORIES,
+    LOGIN_STATUS_META,
+)
+from zatca_timeline_service import (
+    ZATCATimelineService,
+    ZATCA_MILESTONES,
+    render_zatca_timeline_ui,
+)
+from heatmap_service import (
+    HeatmapService,
+    render_calendar_heatmap_ui,
+)
+from audit_archive_service import (
+    AuditArchiveService,
+    render_audit_archive_management_ui,
+    render_cold_storage_browser_ui,
+)
+from audit_annotation_service import (
+    AuditAnnotationService,
+    ANNOTATION_CATEGORIES,
+    render_audit_annotations_ui,
+)
+from zatca_checklist_service import (
+    ZATCATaxChecklistService,
+    render_zatca_sidebar_checklist,
+    render_mini_zatca_compliance_widget,
+)
+
+
 
 
 # =============================================================================
@@ -386,9 +441,20 @@ try:
                         except Exception as ex_pin:
                             st.error(f"❌ {ex_pin}")
             if st.button("🚪 تسجيل الخروج", use_container_width=True):
+                try:
+                    SystemActivityService.log_logout(
+                        db_auth,
+                        user_id=authenticated_user.id,
+                        username=authenticated_user.username,
+                        full_name_ar=authenticated_user.full_name_ar,
+                        details="تسجيل خروج من شاشة تعيين الرمز السري الإلزامي",
+                    )
+                except Exception:
+                    pass
                 st.session_state.pop("authenticated_user_id", None)
                 st.rerun()
         st.stop()
+
 
     active_user_info = {
         "id": authenticated_user.id,
@@ -432,11 +498,25 @@ with st.sidebar:
     sb_c1, sb_c2 = st.columns(2)
     with sb_c1:
         if st.button("🚪 خروج آمن", use_container_width=True):
+            _db_logout = get_db_session()
+            try:
+                SystemActivityService.log_logout(
+                    _db_logout,
+                    user_id=curr_u["id"],
+                    username=curr_u["username"],
+                    full_name_ar=curr_u["full_name_ar"],
+                    details="تسجيل خروج آمن من الشريط الجانبي",
+                )
+            except Exception:
+                pass
+            finally:
+                _db_logout.close()
             st.session_state.pop("authenticated_user_id", None)
             st.session_state.pop("active_user", None)
             st.session_state.pop("active_user_info", None)
             st.rerun()
     with sb_c2:
+
         with st.popover("🔑 تغيير PIN"):
             old_p = st.text_input("الرمز الحالي:", type="password", key="sb_old_pin")
             new_p = st.text_input("الرمز الجديد (6 أرقام):", type="password", key="sb_new_pin")
@@ -479,6 +559,15 @@ with st.sidebar:
         show_global_gdrive = False
         st.caption("🔒 مركز Google Drive والنسخ الاحتياطي لقاعدة البيانات مقيد بصلاحية (`act_cloud_backup`).")
     st.caption(f"السنة المالية: `{comp_year_display}` | IFRS / SOCPA / ZATCA")
+
+    st.divider()
+    _db_sb_chk = get_db_session()
+    try:
+        render_zatca_sidebar_checklist(_db_sb_chk, key_prefix="sb_zatca_check")
+    except Exception:
+        pass
+    finally:
+        _db_sb_chk.close()
 
 
 def render_google_drive_hub_section(
@@ -537,6 +626,131 @@ if show_global_gdrive and menu_option != "📊 لوحة التحكم والمؤ�
         render_google_drive_hub_section(_db_gd, height=520)
     finally:
         _db_gd.close()
+
+def render_dashboard_recharts_and_grounding(db, key_prefix: str = "dash") -> None:
+    """
+    عرض لوحة Recharts البصرية لسجلات التدقيق، الملخص التنفيذي ومؤشرات زاتكا، المخطط الزمني للامتثال، ومحرك Google Search Grounding
+    والإنذار الأمني وجدولة تقارير التدقيق مباشرة داخل لوحة التحكم
+    """
+    dash_t_exec_summary, dash_t_archive, dash_t_heatmap, dash_t_timeline, dash_t_recharts, dash_t_templates, dash_t_alerts, dash_t_sched, dash_t_sys_activity, dash_t_grounding = st.tabs([
+        "👔 الملخص التنفيذي ومؤشرات الأداء Recharts (Executive Summary)",
+        "📦 التخزين البارد والأرشفة (Cold Storage Archival)",
+        "🗓️ الخريطة الحرارية للعمليات والشذوذ (Calendar Heatmap)",
+        "📅 المخطط الزمني لامتثال ZATCA (Compliance Roadmap)",
+        "📊 التحليل البصري لسجلات التدقيق (Recharts Visual Dashboard)",
+        "📑 قوالب التقارير الرقابية المخصصة (Custom Report Templates)",
+        "🚨 الإنذار الأمني وكشف الأنماط المشبوهة (Suspicious Pattern Alerts)",
+        "⏰ جدولة وتوصيل التقارير الدورية (Automated Report Scheduler)",
+        "🖥️ نشاط النظام وسجل الدخول والإعدادات (System Activity)",
+        "🌐 التحديثات والقرارات الرقابية المباشرة (Google Search Grounding - ZATCA & SOCPA)",
+    ])
+
+    with dash_t_exec_summary:
+        st.caption(
+            "لوحة تحكم تنفيذية متقدمة مبنية بـ Recharts لتصوير تردد المعاملات الشهرية، نشاط المستخدمين والمراجعين، "
+            "واتجاهات الامتثال لمتطلبات ZATCA Phase 2 وسلسلة تشفير SHA-256."
+        )
+        render_executive_summary_recharts_module(db, key_prefix=f"{key_prefix}_exec_summary")
+
+    with dash_t_archive:
+        render_audit_archive_management_ui(db, key_prefix=f"{key_prefix}_dash_archive")
+
+    with dash_t_heatmap:
+        st.markdown("##### **🗓️ الخريطة الحرارية التقويمية لكثافة حركات السجل ورصد التنبيهات والأنماط المشبوهة:**")
+        render_calendar_heatmap_ui(db, key_prefix=f"{key_prefix}_heatmap_tab")
+
+    with dash_t_timeline:
+        st.caption("مخطط زمني تفاعلي لاستحقاقات وموجات الفوترة الإلكترونية المرحلة الثانية وإقرارات الزكاة والضريبة لم مساعدة المحاسبين والمراجعين في تخطيط دورة التدقيق.")
+        render_zatca_timeline_ui(db, key_prefix=f"{key_prefix}_tl_tab")
+
+    with dash_t_recharts:
+        st.caption(
+            "تحليل تفاعلي متقدم لتردد العمليات الرقابية لكل مستخدم وحجم تدفق الوثائق والفواتير الضريبية عبر الزمن "
+            "مبني بمكتبة Recharts ومحرك React."
+        )
+        recent_logs = db.query(AuditLog).order_by(AuditLog.id.desc()).limit(1000).all()
+        recharts_payload = aggregate_audit_logs_for_recharts(recent_logs)
+        recharts_html = generate_recharts_dashboard_html(recharts_payload)
+        components.html(recharts_html, height=720, scrolling=True)
+
+    with dash_t_templates:
+        render_audit_template_manager_ui(db, key_prefix=f"{key_prefix}_templates")
+
+    with dash_t_alerts:
+        render_suspicious_audit_alert_ui(db, key_prefix=f"{key_prefix}_alerts")
+
+    with dash_t_sched:
+        render_audit_report_scheduler_ui(db, key_prefix=f"{key_prefix}_sched")
+
+    with dash_t_sys_activity:
+        render_system_activity_module(db, key_prefix=f"{key_prefix}_sys_act")
+
+
+
+    with dash_t_grounding:
+        st.caption(
+            "استعلام مباشر وحي مدعوم بـ Google Search Grounding ونموذج Gemini للتحقق الفوري من أحدث تعاميم وموجات "
+            "الفوترة الإلكترونية المرحلة الثانية (الربط والتكامل) ولوائح ضريبة القيمة المضافة ومعايير SOCPA / IFRS."
+        )
+
+        g_c1, g_c2, g_c3 = st.columns([1.6, 2.0, 1.0])
+        with g_c1:
+            sel_topic = st.selectbox(
+                "اختر المجال الرقابي:",
+                list(ZATCA_TOPICS.keys()),
+                format_func=lambda k: f"{ZATCA_TOPICS[k]['icon']} {ZATCA_TOPICS[k]['title']}",
+                key=f"{key_prefix}_grounding_topic",
+            )
+        with g_c2:
+            custom_q = st.text_input(
+                "أو اكتب استفسارك الرقابي المخصص:",
+                placeholder="مثال: متى موعد إلزام المجموعة 16 بالربط والتكامل وما هي المعايير؟",
+                key=f"{key_prefix}_grounding_custom_q",
+            )
+        with g_c3:
+            st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+            refresh_live = st.button("🔄 بحث وتحديث مباشر", key=f"{key_prefix}_btn_refresh", type="primary")
+
+        with st.spinner("جاري جلب وتحليل القرارات الرقابية المباشرة من زاتكا عبر Google Search..."):
+            reg_data = ZATCAGroundingService.fetch_regulatory_update(
+                topic_key=sel_topic,
+                custom_query=custom_q if custom_q.strip() else None,
+                force_refresh=refresh_live,
+            )
+
+        status_color = "#064e3b" if reg_data.get("is_live_grounded") else "#0f172a"
+        border_color = "#10b981" if reg_data.get("is_live_grounded") else "#38bdf8"
+        icon_badge = "🟢 بحث حي مباشر (Google Search Grounding)" if reg_data.get("is_live_grounded") else "📚 قاعدة القرارات والتعاميم المعتمدة رسمياً"
+
+        st.markdown(f"""
+        <div style="background:{status_color}; border:1px solid {border_color}; border-radius:10px; padding:14px 18px; margin-bottom:16px; color:white;">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                <div style="font-weight:700; font-size:14px;">
+                    {icon_badge} &bull; <span style="color:#38bdf8;">{reg_data.get("provider")}</span>
+                </div>
+                <div style="font-size:12px; color:#cbd5e1; background:rgba(255,255,255,0.08); padding:3px 10px; border-radius:12px;">
+                    🕒 وقت الاستعلام: {reg_data.get("fetched_at")}
+                </div>
+            </div>
+            <div style="font-size:12px; color:#94a3b8; margin-top:6px;">
+                {reg_data.get("note", "")}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown(reg_data["summary"])
+
+        sources = reg_data.get("sources", [])
+        if sources:
+            st.markdown("###### **🔗 المراجع والمصادر الرسمية المعتمدة (Official Citations & Portal Links):**")
+            scols = st.columns(min(len(sources), 3))
+            for idx, src in enumerate(sources):
+                with scols[idx % 3]:
+                    st.markdown(f"- 🌐 [{src['title']}]({src['uri']})")
+
+        queries = reg_data.get("search_queries", [])
+        if queries:
+            st.caption(f"🔍 **استعلامات البحث المنفذة (Google Search Queries):** {', '.join(queries)}")
 
 
 def render_readonly_zatca_audit_log_module(db, key_prefix: str = "zatca_audit") -> None:
@@ -602,6 +816,35 @@ def render_readonly_zatca_audit_log_module(db, key_prefix: str = "zatca_audit") 
     f_opts = base_meta["filter_options"]
     min_db_d: date = f_opts["min_date"]
     max_db_d: date = max(f_opts["max_date"], date.today())
+
+    st.markdown("##### **🔍 شريط البحث بالكلمات المفتاحية في سجل التدقيق الرقابي (Audit Log Keyword Search):**")
+    st.caption("يتيح البحث الفوري والمطابقة المباشرة لأرقام المعاملات (Transaction IDs مثل `#15` أو `REC-15`)، أرقام الفواتير والسندات، أو الملاحظات والتفاصيل (Notes).")
+    with st.container(border=True):
+        sk_c1, sk_c2 = st.columns([4.2, 1.2])
+        with sk_c1:
+            audit_search_q = st.text_input(
+                "ابحث بالمعرف، رقم المعاملة (Transaction ID)، رقم المستند، أو الملاحظات والتفاصيل (Notes):",
+                placeholder="مثال: #15 أو REC-15 أو INV-2026 أو JV-2026 أو USR-001 أو تعديل أو إلغاء أو إهلاك...",
+                key=f"{key_prefix}_search_q",
+                label_visibility="collapsed",
+            )
+        with sk_c2:
+            if st.button("🔄 مسح والبحث مجدداً", key=f"{key_prefix}_btn_clear_q", use_container_width=True):
+                st.session_state[f"{key_prefix}_search_q"] = ""
+                st.rerun()
+
+        st.markdown(
+            "<div style='font-size:11.5px; color:#94a3b8; display:flex; flex-wrap:wrap; gap:8px; align-items:center;'>"
+            "<span>⚡ <b>روابط تصفية سريعة بالكلمات:</b></span>"
+            "<span style='background:#1e293b; padding:2px 8px; border-radius:6px; color:#38bdf8;'>🧾 فواتير: INV-</span>"
+            "<span style='background:#1e293b; padding:2px 8px; border-radius:6px; color:#38bdf8;'>📥 مشتريات: PINV-</span>"
+            "<span style='background:#1e293b; padding:2px 8px; border-radius:6px; color:#38bdf8;'>✍️ قيود: JV-</span>"
+            "<span style='background:#1e293b; padding:2px 8px; border-radius:6px; color:#f59e0b;'>🔄 تعديلات: MODIFY</span>"
+            "<span style='background:#1e293b; padding:2px 8px; border-radius:6px; color:#ef4444;'>❌ عكس قيود: REVERSE</span>"
+            "<span style='background:#1e293b; padding:2px 8px; border-radius:6px; color:#10b981;'>💸 سندات: VCH-</span>"
+            "</div>",
+            unsafe_allow_html=True
+        )
 
     st.markdown("##### **🔎 محرك الفلترة الرقابية المتقدم (حسب نطاق التاريخ، المستخدم، ونوع المعاملة المالية):**")
     with st.container(border=True):
@@ -686,10 +929,11 @@ def render_readonly_zatca_audit_log_module(db, key_prefix: str = "zatca_audit") 
                 key=f"{key_prefix}_action_filter",
             )
         with r2_c4:
-            audit_search_q = st.text_input(
-                "🔍 بحث برقم المستند أو البصمة أو التفاصيل:",
-                placeholder="مثال: INV-2026 أو JV-2026 أو USR-001 أو SHA-256",
-                key=f"{key_prefix}_search_q",
+            rec_limit_val = st.selectbox(
+                "🔢 سقف السجلات المعروضة:",
+                [500, 1000, 2000, 5000],
+                index=1,
+                key=f"{key_prefix}_rec_limit",
             )
 
         r3_c1, r3_c2, _ = st.columns([1.2, 1.5, 2.0])
@@ -697,6 +941,7 @@ def render_readonly_zatca_audit_log_module(db, key_prefix: str = "zatca_audit") 
             min_fin_amt = st.number_input(
                 "💰 الحد الأدنى للمبلغ المالي (ريال):",
                 min_value=0.0,
+
                 value=0.0,
                 step=100.0,
                 key=f"{key_prefix}_min_amt",
@@ -728,12 +973,18 @@ def render_readonly_zatca_audit_log_module(db, key_prefix: str = "zatca_audit") 
         min_amount=min_fin_amt,
         only_modifications=only_mods_flag,
         requesting_user=u_info,
-        limit=1000,
+        limit=rec_limit_val,
     )
 
     q_summary = query_res["summary"]
     audit_df: pd.DataFrame = query_res["dataframe"]
     matched_records = query_res["records"]
+
+    if audit_search_q and audit_search_q.strip():
+        st.info(
+            f"🔍 **نتائج البحث بالكلمات المفتاحية النشطة:** `{audit_search_q.strip()}` — "
+            f"تم العثور على **({q_summary['total_matched']})** سجل تدقيق مطابق لأرقام المعاملات أو الملاحظات المحددة."
+        )
 
     # بطاقات ملخص نتائج الفلترة
     km1, km2, km3, km4 = st.columns(4)
@@ -756,92 +1007,188 @@ def render_readonly_zatca_audit_log_module(db, key_prefix: str = "zatca_audit") 
         st.warning("لا توجد سجلات تدقيق مطابقة لمعايير الفلترة المحددة حالياً.")
         return
 
-    # جدول السجلات الرقابية للقراءة فقط
-    st.dataframe(audit_df, use_container_width=True, hide_index=True)
+    # تبويبات العرض الرقابي الشامل: Recharts البصري، الخريطة الحرارية، المخطط الزمني للامتثال، التخزين البارد والأرشفة، ملاحظات المراجعين، التحقق التجميعي الكتلي، الجدول التفصيلي، قوالب التقارير، نشاط النظام، الإنذار الأمني، الجدولة الآلية، القرارات المباشرة، والتصدير المعتمد
+    t_recharts, t_heatmap, t_timeline, t_archive, t_annot, t_batch_verify, t_table, t_templates, t_sys_activity, t_alerts, t_sched, t_grounding, t_export = st.tabs([
+        "📊 لوحة المؤشرات البصرية Recharts (Visual Dashboard)",
+        "🗓️ الخريطة الحرارية والشذوذ (Calendar Heatmap)",
+        "📅 المخطط الزمني لامتثال ZATCA (Compliance Timeline)",
+        "📦 التخزين البارد والأرشفة (Cold Storage Archival)",
+        "🔒 التعليقات والملاحظات الخاصة للمراجع (Auditor Annotations)",
+        "🔍 أداة التحقق التجميعي الكتلي (Bulk SHA-256 Verifier)",
+        "📋 جدول السجلات والتدقيق الجنائي (Audit Records Table)",
+        "📑 قوالب التقارير الرقابية المخصصة (Custom Report Templates)",
+        "🖥️ نشاط النظام وسجل الدخول والإعدادات (System Activity)",
+        "🚨 الإنذار الأمني وكشف الأنماط المشبوهة (Suspicious Pattern Alerts)",
+        "⏰ جدولة وتوصيل التقارير الدورية (Automated Report Scheduler)",
+        "🌐 القرارات واللوائح الرقابية المباشرة (Google Search Grounding)",
+        "🔒 التصدير المؤمّن والتحقق الجنائي (Immutable PDF & Verifier)",
+    ])
 
-    # إعداد وتصدير تقرير PDF المؤمّن وغير القابل للتعديل لمراجعة المدقق الخارجي ومفتشي ZATCA
-    st.markdown("##### **📄 تصدير وتوثيق سجل التدقيق الرقابي للمراجع الخارجي (Immutable PDF, Signed JSON & CSV):**")
-    auditor_notes_in = st.text_input(
-        "📝 ملاحظات أو توصيات المراجع القانوني الخارجي لتضمينها وختمها داخل وثيقة الـ PDF (اختياري):",
-        value="تم فحص ومطابقة سجل التدقيق الرقابي للقراءة فقط والتحقق من سلامة سلسلة التجزئة التشفيرية SHA-256 وفق متطلبات ZATCA.",
-        key=f"{key_prefix}_auditor_pdf_notes",
-    )
 
-    immutable_pdf_bytes = LedgerService.export_immutable_audit_pdf(
-        db=db,
-        start_date=effective_start,
-        end_date=effective_end,
-        user_filter=sel_user_filter,
-        transaction_type=sel_tx_key,
-        table_name=sel_table_filter,
-        action=sel_action_filter,
-        search_query=audit_search_q,
-        min_amount=min_fin_amt,
-        only_modifications=only_mods_flag,
-        requesting_user=u_info,
-        auditor_notes=auditor_notes_in,
-        limit=1000,
-    )
-    pdf_verification_info = LedgerService.verify_immutable_audit_pdf(immutable_pdf_bytes)
-
-    dl_col1, dl_col2, dl_col3 = st.columns([1.6, 1.3, 1.3])
-    with dl_col1:
-        st.download_button(
-            "📄 تصدير تقرير التدقيق بصيغة PDF غير قابلة للتعديل (Immutable Auditor PDF)",
-            data=immutable_pdf_bytes,
-            file_name=f"ZATCA_Immutable_Audit_Log_{pdf_verification_info.get('document_id', date.today())}.pdf",
-            mime="application/pdf",
-            type="primary",
-            use_container_width=True,
-            key=f"{key_prefix}_dl_immutable_pdf",
+    with t_recharts:
+        st.markdown("##### **📊 التحليل البصري التفاعلي لسجلات التدقيق (Recharts Audit Intelligence Dashboard):**")
+        st.caption(
+            "لوحة رسوم بيانية تفاعلية مبنية بالكامل بمكتبة Recharts ومحرك React لتحليل تردد العمليات وتوزيع الأحمال "
+            "وحجم تدفق الوثائق والفواتير الضريبية عبر الزمن بما يخدم متطلبات الرقابة الداخلية وهيئة الزكاة والضريبة والجمارك (ZATCA)."
         )
-    with dl_col2:
-        csv_audit_bytes = audit_df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            "📥 تصدير السجل المفلتر (ZATCA Audit CSV)",
-            data=csv_audit_bytes,
-            file_name=f"ZATCA_ReadOnly_Audit_Log_{date.today()}.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key=f"{key_prefix}_dl_csv",
-        )
-    with dl_col3:
-        json_export_payload = {
-            "report_title": "ZATCA Read-Only Cryptographic Audit Trail Export",
-            "generated_at_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "integrity_verification": {
-                "is_intact": integrity_rep["is_intact"],
-                "is_read_only_enforced": integrity_rep["is_read_only_enforced"],
-                "latest_chain_hash": integrity_rep["latest_chain_hash"],
-            },
-            "pdf_document_seal": {
-                "document_id": pdf_verification_info.get("document_id"),
-                "core_pdf_sha256": pdf_verification_info.get("core_pdf_sha256"),
-                "manifest_seal_sha256": pdf_verification_info.get("manifest_seal_sha256"),
-                "records_digest_sha256": pdf_verification_info.get("records_digest_sha256"),
-            },
-            "summary": q_summary,
-            "records": matched_records,
-        }
-        json_audit_bytes = json.dumps(json_export_payload, ensure_ascii=False, indent=2).encode("utf-8")
-        st.download_button(
-            "🔐 تصدير الحزمة التشفيرية (Signed Audit JSON)",
-            data=json_audit_bytes,
-            file_name=f"ZATCA_Cryptographic_Audit_Trail_{date.today()}.json",
-            mime="application/json",
-            use_container_width=True,
-            key=f"{key_prefix}_dl_json",
+        recharts_payload = aggregate_audit_logs_for_recharts(query_res.get("logs", []))
+        recharts_html = generate_recharts_dashboard_html(recharts_payload)
+        components.html(recharts_html, height=720, scrolling=True)
+
+    with t_heatmap:
+        st.markdown("##### **🗓️ الخريطة الحرارية التقويمية لتحليل كثافة العمليات اليومية ورصد التنبيهات والأفعال الاستثنائية:**")
+        render_calendar_heatmap_ui(db, key_prefix=f"{key_prefix}_audit_heatmap_tab")
+
+    with t_timeline:
+        st.markdown("##### **📅 المخطط الزمني لخارطة امتثال هيئة الزكاة والضريبة والجمارك وتخطيط دورات المراجعة (ZATCA Timeline & Audit Planner):**")
+        render_zatca_timeline_ui(db, key_prefix=f"{key_prefix}_timeline_tab")
+
+    with t_archive:
+        render_audit_archive_management_ui(db, key_prefix=f"{key_prefix}_audit_archive_tab")
+
+    with t_annot:
+        render_audit_annotations_ui(db, key_prefix=f"{key_prefix}_annot_tab")
+
+    with t_batch_verify:
+        st.markdown("##### **🔍 أداة التحقق التجميعي الكتلي من البصمات التشفيرية (Bulk SHA-256 Batch Verification Tool):**")
+        st.caption(
+            "تتيح للمراجعين القانونيين والرقابيين تحديد سجلات تدقيق متعددة وتنفيذ فحص تشفيري كتلي لجميع البصمات المخزنة "
+            "ومطابقتها مع القيم المحسوبة لمنع وكشف أي تعديل أو تلاعب في البيانات."
         )
 
-    st.success(
-        f"🔒 **بيانات الختم التشفيري لوثيقة PDF المولّدة (`{pdf_verification_info.get('document_id')}`):**  \n"
-        f"- **حالة القفل وعدم القابلية للتعديل:** `{pdf_verification_info.get('permissions_mode')}` — {pdf_verification_info.get('status_ar')}  \n"
-        f"- **بصمة صفحات الـ PDF (`Core PDF SHA-256`):** `{pdf_verification_info.get('core_pdf_sha256')}`  \n"
-        f"- **الختم التشفيري للوثيقة (`Manifest Seal SHA-256`):** `{pdf_verification_info.get('manifest_seal_sha256')}`"
-    )
+        bv_col1, bv_col2 = st.columns([3, 1])
+        with bv_col1:
+            all_log_ids = [l["id"] for l in matched_records] if matched_records else []
+            sel_batch_ids = st.multiselect(
+                "اختر أرقام سجلات التدقيق المراد فحصها بالدفعة (أو اترك حقل الاختيار فارغاً لفحص كافة السجلات المفلترة):",
+                options=all_log_ids,
+                default=[],
+                key=f"{key_prefix}_bv_ids",
+            )
+        with bv_col2:
+            st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+            run_bv_btn = st.button("🚀 تشغيل الفحص الجماعي (Run Bulk SHA-256 Check)", type="primary", key=f"{key_prefix}_btn_run_bv")
 
-    with st.expander("🖨️ **معاينة النسخة الرسمية القابلة للطباعة والاعتماد للمراجع القانوني الخارجي (Printable External Auditor Report)**", expanded=False):
-        printable_audit_html = PrintTemplateService.generate_audit_log_printable_html(
+        target_ids = sel_batch_ids if sel_batch_ids else all_log_ids
+        bv_res = LedgerService.verify_bulk_audit_log_entries(db, selected_ids=target_ids)
+
+        bm1, bm2, bm3, bm4 = st.columns(4)
+        bm1.metric("عدد السجلات المفحوصة بالدفعة", f"{bv_res['total_checked']} سجل")
+        bm2.metric("البصمات المطابقة والسليمة", f"{bv_res['valid_count']} ✅")
+        bm3.metric("الانحرافات والخروقات المرصودة", f"{bv_res['broken_count']} ❌")
+        bm4.metric("حالة الختم التجميعي للدفعة", "دفعة سليمة 100% 🟢" if bv_res["is_batch_intact"] else "خروقات أمنية 🔴")
+
+        st.info(f"🔐 **الختم التشفيري للدفعة المفحوصة (`Batch SHA-256 Seal`):** `{bv_res['batch_sha256_seal']}`")
+
+        if not bv_res["dataframe"].empty:
+            st.markdown("###### **📋 تفاصيل شواهد الفحص التجميعي لمطابقة الهاش بالدفعة:**")
+            st.dataframe(bv_res["dataframe"], use_container_width=True, hide_index=True)
+
+            bv_csv_data = bv_res["dataframe"].to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+            st.download_button(
+                "📥 تصدير شهادة الفحص التجميعي (Bulk Verification Certificate - CSV)",
+                data=bv_csv_data,
+                file_name=f"ZATCA_Bulk_SHA256_Verification_Report_{date.today()}.csv",
+                mime="text/csv",
+                key=f"{key_prefix}_bv_dl_csv",
+            )
+
+    with t_table:
+        st.markdown("##### **📋 جدول السجلات الرقابية التفصيلية غير القابلة للتعديل (Read-Only Audit Trail):**")
+        st.dataframe(audit_df, use_container_width=True, hide_index=True)
+        with st.expander("📝 **توثيق ملاحظة سرية أو تعليق رقمي للمراجع على أحد السجلات أعلاه**", expanded=False):
+            render_audit_annotations_ui(db, key_prefix=f"{key_prefix}_table_annot_exp")
+
+    with t_templates:
+        render_audit_template_manager_ui(db, key_prefix=f"{key_prefix}_tpl_tab")
+
+    with t_sys_activity:
+        render_system_activity_module(db, key_prefix=f"{key_prefix}_sys_act_tab")
+
+    with t_alerts:
+        render_suspicious_audit_alert_ui(db, key_prefix=f"{key_prefix}_alerts_tab")
+
+
+    with t_sched:
+        render_audit_report_scheduler_ui(db, key_prefix=f"{key_prefix}_sched_tab")
+
+
+    with t_grounding:
+        st.markdown("##### **🌐 محرك الاستعلام والرقابة المباشرة على أحدث قرارات زاتكا ومعايير المحاسبة (Google Search Grounding):**")
+        st.caption(
+            "استعلام مباشر وحي مدعوم بـ Google Search Grounding ونموذج Gemini للتحقق الفوري من أحدث تعاميم وموجات "
+            "الفوترة الإلكترونية المرحلة الثانية (الربط والتكامل) ولوائح ضريبة القيمة المضافة ومعايير SOCPA / IFRS."
+        )
+
+        g_c1, g_c2, g_c3 = st.columns([1.6, 2.0, 1.0])
+        with g_c1:
+            sel_topic = st.selectbox(
+                "اختر المجال الرقابي:",
+                list(ZATCA_TOPICS.keys()),
+                format_func=lambda k: f"{ZATCA_TOPICS[k]['icon']} {ZATCA_TOPICS[k]['title']}",
+                key=f"{key_prefix}_grounding_topic",
+            )
+        with g_c2:
+            custom_q = st.text_input(
+                "أو اكتب استفسارك الرقابي المخصص:",
+                placeholder="مثال: متى موعد إلزام المجموعة 16 بالربط والتكامل؟",
+                key=f"{key_prefix}_grounding_custom_q",
+            )
+        with g_c3:
+            st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+            refresh_live = st.button("🔄 بحث وتحديث مباشر", key=f"{key_prefix}_btn_refresh_grounding", type="primary")
+
+        with st.spinner("جاري جلب وتحليل القرارات الرقابية المباشرة من زاتكا عبر Google Search..."):
+            reg_data = ZATCAGroundingService.fetch_regulatory_update(
+                topic_key=sel_topic,
+                custom_query=custom_q if custom_q.strip() else None,
+                force_refresh=refresh_live,
+            )
+
+        status_color = "#064e3b" if reg_data.get("is_live_grounded") else "#0f172a"
+        border_color = "#10b981" if reg_data.get("is_live_grounded") else "#38bdf8"
+        icon_badge = "🟢 بحث حي مباشر (Google Search Grounding)" if reg_data.get("is_live_grounded") else "📚 قاعدة القرارات والتعاميم المعتمدة رسمياً"
+
+        st.markdown(f"""
+        <div style="background:{status_color}; border:1px solid {border_color}; border-radius:10px; padding:14px 18px; margin-bottom:16px; color:white;">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                <div style="font-weight:700; font-size:14px;">
+                    {icon_badge} &bull; <span style="color:#38bdf8;">{reg_data.get("provider")}</span>
+                </div>
+                <div style="font-size:12px; color:#cbd5e1; background:rgba(255,255,255,0.08); padding:3px 10px; border-radius:12px;">
+                    🕒 وقت الاستعلام: {reg_data.get("fetched_at")}
+                </div>
+            </div>
+            <div style="font-size:12px; color:#94a3b8; margin-top:6px;">
+                {reg_data.get("note", "")}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown(reg_data["summary"])
+
+        sources = reg_data.get("sources", [])
+        if sources:
+            st.markdown("###### **🔗 المراجع والمصادر الرسمية المعتمدة (Official Citations & Portal Links):**")
+            scols = st.columns(min(len(sources), 3))
+            for idx, src in enumerate(sources):
+                with scols[idx % 3]:
+                    st.markdown(f"- 🌐 [{src['title']}]({src['uri']})")
+
+        queries = reg_data.get("search_queries", [])
+        if queries:
+            st.caption(f"🔍 **استعلامات البحث المنفذة (Google Search Queries):** {', '.join(queries)}")
+
+    with t_export:
+        # إعداد وتصدير تقرير PDF المؤمّن وغير القابل للتعديل لمراجعة المدقق الخارجي ومفتشي ZATCA
+        st.markdown("##### **📄 تصدير وتوثيق سجل التدقيق الرقابي للمراجع الخارجي (Immutable PDF, Signed JSON & CSV):**")
+        auditor_notes_in = st.text_input(
+            "📝 ملاحظات أو توصيات المراجع القانوني الخارجي لتضمينها وختمها داخل وثيقة الـ PDF (اختياري):",
+            value="تم فحص ومطابقة سجل التدقيق الرقابي للقراءة فقط والتحقق من سلامة سلسلة التجزئة التشفيرية SHA-256 وفق متطلبات ZATCA.",
+            key=f"{key_prefix}_auditor_pdf_notes",
+        )
+
+        immutable_pdf_bytes = LedgerService.export_immutable_audit_pdf(
             db=db,
             start_date=effective_start,
             end_date=effective_end,
@@ -854,9 +1201,83 @@ def render_readonly_zatca_audit_log_module(db, key_prefix: str = "zatca_audit") 
             only_modifications=only_mods_flag,
             requesting_user=u_info,
             auditor_notes=auditor_notes_in,
-            limit=250,
+            limit=1000,
         )
-        components.html(printable_audit_html, height=580, scrolling=True)
+        pdf_verification_info = LedgerService.verify_immutable_audit_pdf(immutable_pdf_bytes)
+
+        dl_col1, dl_col2, dl_col3 = st.columns([1.6, 1.3, 1.3])
+        with dl_col1:
+            st.download_button(
+                "📄 تصدير تقرير التدقيق بصيغة PDF غير قابلة للتعديل (Immutable Auditor PDF)",
+                data=immutable_pdf_bytes,
+                file_name=f"ZATCA_Immutable_Audit_Log_{pdf_verification_info.get('document_id', date.today())}.pdf",
+                mime="application/pdf",
+                type="primary",
+                use_container_width=True,
+                key=f"{key_prefix}_dl_immutable_pdf",
+            )
+        with dl_col2:
+            csv_audit_bytes = audit_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "📥 تصدير السجل المفلتر (ZATCA Audit CSV)",
+                data=csv_audit_bytes,
+                file_name=f"ZATCA_ReadOnly_Audit_Log_{date.today()}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key=f"{key_prefix}_dl_csv",
+            )
+        with dl_col3:
+            json_export_payload = {
+                "report_title": "ZATCA Read-Only Cryptographic Audit Trail Export",
+                "generated_at_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "integrity_verification": {
+                    "is_intact": integrity_rep["is_intact"],
+                    "is_read_only_enforced": integrity_rep["is_read_only_enforced"],
+                    "latest_chain_hash": integrity_rep["latest_chain_hash"],
+                },
+                "pdf_document_seal": {
+                    "document_id": pdf_verification_info.get("document_id"),
+                    "core_pdf_sha256": pdf_verification_info.get("core_pdf_sha256"),
+                    "manifest_seal_sha256": pdf_verification_info.get("manifest_seal_sha256"),
+                    "records_digest_sha256": pdf_verification_info.get("records_digest_sha256"),
+                },
+                "summary": q_summary,
+                "records": matched_records,
+            }
+            json_audit_bytes = json.dumps(json_export_payload, ensure_ascii=False, indent=2).encode("utf-8")
+            st.download_button(
+                "🔐 تصدير الحزمة التشفيرية (Signed Audit JSON)",
+                data=json_audit_bytes,
+                file_name=f"ZATCA_Cryptographic_Audit_Trail_{date.today()}.json",
+                mime="application/json",
+                use_container_width=True,
+                key=f"{key_prefix}_dl_json",
+            )
+
+        st.success(
+            f"🔒 **بيانات الختم التشفيري لوثيقة PDF المولّدة (`{pdf_verification_info.get('document_id')}`):**  \n"
+            f"- **حالة القفل وعدم القابلية للتعديل:** `{pdf_verification_info.get('permissions_mode')}` — {pdf_verification_info.get('status_ar')}  \n"
+            f"- **بصمة صفحات الـ PDF (`Core PDF SHA-256`):** `{pdf_verification_info.get('core_pdf_sha256')}`  \n"
+            f"- **الختم التشفيري للوثيقة (`Manifest Seal SHA-256`):** `{pdf_verification_info.get('manifest_seal_sha256')}`"
+        )
+
+        with st.expander("🖨️ **معاينة النسخة الرسمية القابلة للطباعة والاعتماد للمراجع القانوني الخارجي (Printable External Auditor Report)**", expanded=False):
+            printable_audit_html = PrintTemplateService.generate_audit_log_printable_html(
+                db=db,
+                start_date=effective_start,
+                end_date=effective_end,
+                user_filter=sel_user_filter,
+                transaction_type=sel_tx_key,
+                table_name=sel_table_filter,
+                action=sel_action_filter,
+                search_query=audit_search_q,
+                min_amount=min_fin_amt,
+                only_modifications=only_mods_flag,
+                requesting_user=u_info,
+                auditor_notes=auditor_notes_in,
+                limit=250,
+            )
+            components.html(printable_audit_html, height=580, scrolling=True)
 
     with st.expander("🛡️ **أداة المراجع الخارجي للتحقق الجنائي من سلامة وعدم التلاعب بملف PDF المصدّر (External Auditor PDF Seal Verifier)**", expanded=False):
         st.caption(
@@ -977,11 +1398,32 @@ def render_readonly_zatca_audit_log_module(db, key_prefix: str = "zatca_audit") 
                 else:
                     st.caption(sel_rec["details"] or "-")
 
-            st.markdown(
-                f"🔗 **البصمة السابقة (`Previous Chain Hash`):** `{sel_rec['previous_hash']}`  \n"
-                f"🛡️ **بصمة السجل الحالية (`Entry SHA-256 Hash`):** `{sel_rec['entry_hash']}` — "
-                f"**{'مطابقة وسليمة تشفيرياً ✅' if sel_rec['is_hash_valid'] else 'تحذير: البصمة غير مطابقة ❌'}**"
-            )
+            # التحقق الجنائي التشفيري المباشر لسجل فردي بواسطة LedgerService.verify_single_entry_hash
+            single_verify = LedgerService.verify_single_entry_hash(db, sel_rec['id'])
+            if single_verify.get("success"):
+                st.markdown("---")
+                st.markdown("##### **🔐 أداة المراجع الخارجي للتحقق التشفيري المباشر لبصمة SHA-256 للسجل الفردي (Auditor Single-Record SHA-256 Verifier):**")
+                v_badge = "✅ SHA-256 Verified Match (سليمة لم تتعرض لأي تعديل)" if single_verify["is_hash_valid"] else "❌ Hash Mismatch (تنبيه: عدم تطابق البصمة!)"
+                st.markdown(f"**حالة التحقق الجنائي:** `{v_badge}` — {single_verify['status_text']}")
+
+                vh_c1, vh_c2 = st.columns(2)
+                with vh_c1:
+                    st.markdown("**🔗 البصمة السابقة المخرجة (`Stored Previous Hash`):**")
+                    st.code(single_verify["stored_previous_hash"], language="text")
+                    st.markdown("**🛡️ البصمة المخزنة بالسجل (`Stored Entry Hash`):**")
+                    st.code(single_verify["stored_entry_hash"], language="text")
+                with vh_c2:
+                    st.markdown("**⚡ النص المترابط المعياري لمحتوى السجل (`Canonical Payload String`):**")
+                    st.code(single_verify["canonical_payload_string"], language="text")
+                    st.markdown("**🧮 البصمة المعاد حسابها لحظياً (`Recomputed SHA-256 Hash`):**")
+                    st.code(single_verify["recomputed_entry_hash"], language="text")
+            else:
+                st.markdown(
+                    f"🔗 **البصمة السابقة (`Previous Chain Hash`):** `{sel_rec['previous_hash']}`  \n"
+                    f"🛡️ **بصمة السجل الحالية (`Entry SHA-256 Hash`):** `{sel_rec['entry_hash']}` — "
+                    f"**{'مطابقة وسليمة تشفيرياً ✅' if sel_rec['is_hash_valid'] else 'تحذير: البصمة غير مطابقة ❌'}**"
+                )
+
 
 
 # =============================================================================
@@ -1007,6 +1449,8 @@ if menu_option == "📊 لوحة التحكم والمؤشرات":
             <p style="margin:5px 0 0 0; color:#CBD5E1; font-size:14px;">متابعة لحظية للأداء المالي، السيولة، المخزون، الأصول، ضريبة القيمة المضافة، ووعاء الزكاة لعام {settings.fiscal_year}</p>
         </div>
         """, unsafe_allow_html=True)
+
+        render_mini_zatca_compliance_widget(db, key_prefix="exec_mini_zatca")
 
         c1, c2, c3, c4 = st.columns(4)
         with c1:
@@ -1097,12 +1541,12 @@ if menu_option == "📊 لوحة التحكم والمؤشرات":
             st.plotly_chart(fig_assets, use_container_width=True)
 
         st.divider()
-        col_btn, col_stat = st.columns(2)
-        with col_btn:
+        col_btn1, col_btn2, col_stat = st.columns([1.2, 1.2, 1.1])
+        with col_btn1:
             if has_perm("act_export_reports"):
                 excel_bytes = ExcelExportService.generate_master_excel_report(db, fiscal_year=settings.fiscal_year)
                 st.download_button(
-                    label="📥 تحميل التقرير المالي والرقابي الشامل للنظام (Excel - 15 صفحة)",
+                    label="📥 تحميل التقرير الشامل (Excel - 15 صفحة)",
                     data=excel_bytes,
                     file_name=f"MizanPro_Master_Financial_Report_{settings.fiscal_year}_15_Sheets.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1111,11 +1555,41 @@ if menu_option == "📊 لوحة التحكم والمؤشرات":
                 )
             else:
                 st.info("🔒 صلاحية تصدير التقارير الشاملة (Excel) غير مفعلة لحسابك الحالي.")
+        with col_btn2:
+            if has_perm("act_export_reports"):
+                csv_gl_bytes = CSVExportService.generate_general_ledger_csv(db, fiscal_year=settings.fiscal_year)
+                st.download_button(
+                    label="📊 تصدير دفتر الأستاذ العام (CSV للمراجع الخارجي)",
+                    data=csv_gl_bytes,
+                    file_name=f"MizanPro_General_Ledger_{settings.fiscal_year}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            else:
+                st.info("🔒 صلاحية التصدير (CSV) غير مفعلة لحسابك الحالي.")
         with col_stat:
             if bs['is_balanced']:
                 st.markdown('<div class="balanced-badge">✅ الميزانية العمومية وميزان المراجعة متزنان 100%</div>', unsafe_allow_html=True)
             else:
                 st.error(f"❌ يوجد فرق في اتزان الميزانية قدره: {bs['balance_difference']:,.2f}")
+
+        st.divider()
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #0F172A 0%, #1E293B 100%); color: white; padding: 18px 22px; border-radius: 12px; border-right: 6px solid #0284C7; margin-bottom: 16px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                <div>
+                    <h3 style="margin:0; color:#F8FAFC;">🛡️ مركز التحليل البصري Recharts وقرارات زاتكا ومعايير المحاسبة الحية (ZATCA Audit & Regulatory Intelligence)</h3>
+                    <p style="margin:5px 0 0 0; color:#CBD5E1; font-size:13px;">
+                        لوحة تفاعلية مبنية بـ Recharts لتحليل تردد عمليات المستخدمين وتدفق الوثائق والفواتير الضريبية عبر الزمن، مع استعلام حي مدعوم بـ Google Search Grounding لأحدث قرارات هيئة الزكاة والضريبة والجمارك (ZATCA Phase 2) ومعايير SOCPA / IFRS.
+                    </p>
+                </div>
+                <div style="background:#0369A1; color:#E0F2FE; padding:6px 14px; border-radius:20px; font-size:12px; font-weight:700;">
+                    📊 Recharts + Google Search Grounding
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        render_dashboard_recharts_and_grounding(db, key_prefix="exec_dashboard")
 
         st.divider()
         st.markdown("#### **☁️ التكامل السحابي المباشر مع Google Drive (حفظ ومزامنة التقارير والنسخ الاحتياطية):**")
@@ -1320,15 +1794,16 @@ elif menu_option == "📑 محلل ميزان المراجعة الخارجي و
         k3.metric("صافي أرباح / (خسائر) الفترة", f"{cpa_pnl['net_profit_loss']:,.0f} ريال")
         k4.metric("الوعاء الزكوي / الزكاة المستحقة", f"{cpa_pnl['zakat_expense']:,.0f} ريال", delta=f"الوعاء: {cpa_nd['note_11_zakat']['zakat_base']:,.0f} ريال")
 
-        # أزرار التصدير الثلاثية: HTML/PDF + Word (.doc) + Excel (.xlsx)
+        # أزرار التصدير الرباعية: HTML/PDF + Word (.doc) + Excel (.xlsx) + CSV (.csv)
         cpa_html_report = ExternalTBAnalyzerService.generate_cpa_printable_html(cpa_pkg)
         cpa_word_bytes = ExternalTBAnalyzerService.generate_cpa_word_doc(cpa_pkg)
         cpa_excel_bytes = ExternalTBAnalyzerService.generate_cpa_excel_workbook(active_tb_df, cpa_pkg)
+        cpa_csv_bytes = ExternalTBAnalyzerService.generate_cpa_csv(active_tb_df, cpa_pkg)
 
-        dl1, dl2, dl3 = st.columns(3)
+        dl1, dl2, dl3, dl4 = st.columns(4)
         with dl1:
             st.download_button(
-                label="🖨️ تحميل التقرير الرسمي للطباعة (PDF / HTML)",
+                label="🖨️ التقرير الرسمي (PDF/HTML)",
                 data=cpa_html_report,
                 file_name=f"CPA_Report_{ext_comp_name}.html",
                 mime="text/html",
@@ -1338,7 +1813,7 @@ elif menu_option == "📑 محلل ميزان المراجعة الخارجي و
             )
         with dl2:
             st.download_button(
-                label="📝 تحميل التقرير كملف Word قابل للتعديل (.doc)",
+                label="📝 التقرير كملف Word (.doc)",
                 data=cpa_word_bytes,
                 file_name=f"CPA_Audited_Financial_Statements_{ext_comp_name}.doc",
                 mime="application/msword",
@@ -1346,11 +1821,20 @@ elif menu_option == "📑 محلل ميزان المراجعة الخارجي و
             )
         with dl3:
             st.download_button(
-                label="📊 تحميل القوائم والإيضاحات بصيغة Excel (.xlsx)",
+                label="📊 القوائم والإيضاحات (Excel)",
                 data=cpa_excel_bytes,
                 file_name=f"CPA_Financial_Statements_{ext_comp_name}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
+            )
+        with dl4:
+            st.download_button(
+                label="📥 ميزان المراجعة والقوائم (CSV)",
+                data=cpa_csv_bytes,
+                file_name=f"CPA_Trial_Balance_and_Statements_{ext_comp_name}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                disabled=not has_perm("act_export_reports")
             )
 
         with st.expander("☁️ **حفظ ومزامنة تقرير المراجع القانوني والقوائم المالية مباشرة في Google Drive**", expanded=False):
@@ -3193,16 +3677,28 @@ elif menu_option == "🏛️ القوائم المالية والزكاة وال
 
         with fs_c4:
             st.markdown("<br>", unsafe_allow_html=True)
+            fs_btn_c1, fs_btn_c2 = st.columns(2)
             xl_bytes = ExportService.generate_excel_workbook(tb_df, report, company_name=settings.company_name_ar)
-            st.download_button(
-                "📊 تصدير القوائم المالية والزكاة والضريبة (Excel)",
-                data=xl_bytes,
-                file_name=f"MizanPro_Financial_Package_{eff_sdt}_{eff_edt}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                type="primary",
-                disabled=not has_perm("act_export_reports")
-            )
+            csv_pkg_bytes = ExportService.generate_financial_statements_csv(report, company_name=settings.company_name_ar, trial_balance_df=tb_df)
+            with fs_btn_c1:
+                st.download_button(
+                    "📊 تصدير القوائم (Excel)",
+                    data=xl_bytes,
+                    file_name=f"MizanPro_Financial_Package_{eff_sdt}_{eff_edt}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    type="primary",
+                    disabled=not has_perm("act_export_reports")
+                )
+            with fs_btn_c2:
+                st.download_button(
+                    "📥 تحليل القوائم (CSV)",
+                    data=csv_pkg_bytes,
+                    file_name=f"MizanPro_Statements_Analysis_{eff_sdt}_{eff_edt}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    disabled=not has_perm("act_export_reports")
+                )
 
         t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
             "📈 قائمة الدخل", "🏛️ المركز المالي", "💵 التدفقات النقدية",
@@ -3394,16 +3890,41 @@ elif menu_option == "🔍 سجل التدقيق الرقابي للقراءة ف
 
 
 # =============================================================================
+# 13.ج الشاشة المستقلة: نشاط النظام وسجل الدخول والإعدادات (System Activity)
+# =============================================================================
+elif menu_option == "🖥️ نشاط النظام وسجل الدخول والإعدادات (System Activity)":
+    db = get_db_session()
+    try:
+        render_system_activity_module(db, key_prefix="standalone_sys_act")
+    finally:
+        db.close()
+
+
+# =============================================================================
+# 13.د الشاشة المستقلة: المخطط الزمني لامتثال زاتكا (ZATCA Timeline)
+# =============================================================================
+elif menu_option == "📅 المخطط الزمني لامتثال هيئة الزكاة والضريبة والجمارك (ZATCA Timeline)":
+    db = get_db_session()
+    try:
+        st.markdown("### **📅 المخطط الزمني لخارطة امتثال زاتكا وتخطيط دورات المراجعة (ZATCA Compliance Roadmap & Audit Cycle Planner)**")
+        render_zatca_timeline_ui(db, key_prefix="standalone_zatca_tl")
+    finally:
+        db.close()
+
+
+# =============================================================================
 # 14. الشاشة 12: شجرة الحسابات، إعدادات المنشأة، التخصيص الحر للصلاحيات، وسجل الرقابة
 # =============================================================================
 elif menu_option == "🌳 شجرة الحسابات، الإعدادات، وصلاحيات المستخدمين":
     st.markdown("### **دليل الحسابات الشجري، إعدادات المنشأة، التخصيص الحر لصلاحيات المستخدمين، وسجل التدقيق**")
-    t_users, t_coa, t_cfg, t_audit = st.tabs([
+    t_users, t_coa, t_cfg, t_activity, t_audit = st.tabs([
         "👥 إدارة المستخدمين والتخصيص الحر للصلاحيات",
         "🌳 شجرة الحسابات (COA)",
         "⚙️ إعدادات المنشأة والضريبة",
+        "🖥️ نشاط النظام وسجل الدخول والإعدادات",
         "🛡️ سجل الرقابة والتدقيق الإلزامي للقراءة فقط (ZATCA Read-Only Audit Log)"
     ])
+
 
     db = get_db_session()
     try:
@@ -3627,6 +4148,9 @@ elif menu_option == "🌳 شجرة الحسابات، الإعدادات، وص�
                     st.rerun()
                 except Exception as ex_cfg:
                     st.error(f"❌ {ex_cfg}")
+
+        with t_activity:
+            render_system_activity_module(db, key_prefix="settings_tab_activity")
 
         with t_audit:
             render_readonly_zatca_audit_log_module(db, key_prefix="settings_tab_audit")

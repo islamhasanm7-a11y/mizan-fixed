@@ -1531,3 +1531,78 @@ class ExternalTBAnalyzerService:
         wb.save(out)
         out.seek(0)
         return out
+
+    @classmethod
+    def generate_cpa_csv(cls, classified_df: pd.DataFrame, pkg: Dict[str, Any]) -> bytes:
+        """
+        توليد ملف CSV معتمد وشامل لميزان المراجعة المصنف وتوجيه الإيضاحات والقوائم المالية (CPA Tabular CSV)
+        بتنسيق مسطح غير مدمج مع ترميز UTF-8-SIG للتحليل الخارجي الفوري في برامج الجداول الإلكترونية (Excel, Google Sheets, PowerBI)
+        """
+        rows: List[Dict[str, Any]] = []
+
+        m = pkg.get("metadata", {})
+        comp_name = m.get("company_name", "المنشأة الخاضعة للمراجعة")
+        period_lbl = m.get("period_text", "الفترة المالية")
+        opinion_lbl = m.get("audit_opinion_text", "تقرير المراجع المستقل")
+
+        # 1. إدراج ميزان المراجعة المصنف وتوجيه الإيضاحات
+        for _, r in classified_df.iterrows():
+            d_curr = round(float(r.get("مدين آخر المدة", 0.0) or 0.0), 2)
+            c_curr = round(float(r.get("دائن آخر المدة", 0.0) or 0.0), 2)
+            net_curr = round(d_curr - c_curr, 2)
+            d_comp = round(float(r.get("مدين مقارنة", 0.0) or 0.0), 2)
+            c_comp = round(float(r.get("دائن مقارنة", 0.0) or 0.0), 2)
+            net_comp = round(d_comp - c_comp, 2)
+            mapping_cls = str(r.get("التصنيف في القوائم والإيضاحات", "") or "")
+
+            rows.append({
+                "نوع السجل": "حساب ميزان مراجعة",
+                "كود الحساب": str(r.get("كود الحساب", "")),
+                "اسم الحساب": str(r.get("اسم الحساب", "")),
+                "مدين الفترة الحالية": d_curr,
+                "دائن الفترة الحالية": c_curr,
+                "صافي الرصيد الحالي": net_curr,
+                "مدين سنة المقارنة": d_comp,
+                "دائن سنة المقارنة": c_comp,
+                "صافي رصيد المقارنة": net_comp,
+                "التصنيف الرقابي في القوائم والإيضاحات": mapping_cls,
+                "ملاحظات المراجع": f"{comp_name} - {period_lbl}"
+            })
+
+        # 2. ملخص القوائم الخمس والإيضاحات للمقارنة والتحليل
+        bs = pkg.get("balance_sheet", {})
+        pnl = pkg.get("income_statement", {})
+        cf = pkg.get("cash_flow_statement", {})
+
+        summary_items = [
+            ("ملخص قائمة الدخل", "صافي الإيرادات", pnl.get("net_revenue", 0.0), pnl.get("comp_net_revenue", 0.0), "إيضاح 13"),
+            ("ملخص قائمة الدخل", "مجمل الربح", pnl.get("gross_profit", 0.0), pnl.get("comp_gross_profit", 0.0), "إيضاح 13 و 14"),
+            ("ملخص قائمة الدخل", "المصروفات الإدارية والعمومية", -pnl.get("ga_expenses", 0.0), -pnl.get("comp_ga_expenses", 0.0), "إيضاح 15"),
+            ("ملخص قائمة الدخل", "صافي ربح / (خسارة) الفترة", pnl.get("net_profit", 0.0), pnl.get("comp_net_profit", 0.0), "النتيجة النهائية"),
+            ("ملخص المركز المالي", "إجمالي الأصول المتداولة", bs.get("current_assets_total", 0.0), bs.get("comp_current_assets_total", 0.0), "إيضاح 5-8"),
+            ("ملخص المركز المالي", "إجمالي الأصول غير المتداولة", bs.get("non_current_assets_total", 0.0), bs.get("comp_non_current_assets_total", 0.0), "إيضاح 4"),
+            ("ملخص المركز المالي", "إجمالي الأصول", bs.get("total_assets", 0.0), bs.get("comp_total_assets", 0.0), "مجموع الموجودات"),
+            ("ملخص المركز المالي", "إجمالي الالتزامات المتداولة", bs.get("current_liabilities_total", 0.0), bs.get("comp_current_liabilities_total", 0.0), "إيضاح 9-11"),
+            ("ملخص المركز المالي", "إجمالي حقوق الملكية", bs.get("equity_total", 0.0), bs.get("comp_equity_total", 0.0), "حقوق الملاك"),
+            ("ملخص التدفقات النقدية", "صافي التدفق النقدي التشغيلي", cf.get("net_operating_cf", 0.0), 0.0, "الأنشطة التشغيلية"),
+            ("ملخص التدفقات النقدية", "رصيد النقد آخر الفترة", cf.get("closing_cash", 0.0), 0.0, "إيضاح 5"),
+        ]
+
+        for s_type, item_name, val_curr, val_comp, note_ref in summary_items:
+            rows.append({
+                "نوع السجل": s_type,
+                "كود الحساب": "-",
+                "اسم الحساب": item_name,
+                "مدين الفترة الحالية": round(float(val_curr or 0.0), 2) if (val_curr or 0) >= 0 else 0.0,
+                "دائن الفترة الحالية": abs(round(float(val_curr or 0.0), 2)) if (val_curr or 0) < 0 else 0.0,
+                "صافي الرصيد الحالي": round(float(val_curr or 0.0), 2),
+                "مدين سنة المقارنة": round(float(val_comp or 0.0), 2) if (val_comp or 0) >= 0 else 0.0,
+                "دائن سنة المقارنة": abs(round(float(val_comp or 0.0), 2)) if (val_comp or 0) < 0 else 0.0,
+                "صافي رصيد المقارنة": round(float(val_comp or 0.0), 2),
+                "التصنيف الرقابي في القوائم والإيضاحات": note_ref,
+                "ملاحظات المراجع": f"نوع الرأي: {opinion_lbl}"
+            })
+
+        df = pd.DataFrame(rows)
+        return df.to_csv(index=False).encode("utf-8-sig")
+

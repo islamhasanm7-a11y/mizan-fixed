@@ -332,6 +332,8 @@ SYSTEM_MODULES: Dict[str, str] = {
     "mod_ledger": "📖 كشف الحساب وميزان المراجعة",
     "mod_statements": "🏛️ القوائم المالية والزكاة والضريبة",
     "mod_audit_log": "🔍 سجل التدقيق الرقابي للقراءة فقط (ZATCA Audit Log)",
+    "mod_system_activity": "🖥️ نشاط النظام وسجل الدخول والإعدادات (System Activity)",
+    "mod_zatca_timeline": "📅 المخطط الزمني لامتثال هيئة الزكاة والضريبة والجمارك (ZATCA Timeline)",
     "mod_settings": "🌳 شجرة الحسابات، الإعدادات، وصلاحيات المستخدمين",
 }
 
@@ -352,12 +354,14 @@ SYSTEM_ACTIONS: Dict[str, str] = {
     "act_cpa_profiles": "حفظ وتعديل قوالب التوجيه المحاسبي في محلل الميزان (CPA)",
     "act_export_reports": "تصدير التقارير المالية (Excel / Word / PDF)",
     "act_view_audit_logs": "الاطلاع على سجل التدقيق الرقابي للقراءة فقط وفلترته وتصديره (ZATCA Audit Log)",
+    "act_view_system_activity": "الاطلاع على نشاط النظام وسجل الدخول وتغييرات الإعدادات (System Activity)",
     "act_cloud_backup": "الوصول لمركز Google Drive السحابي وتصدير/استعادة النسخ الاحتياطية",
     "act_close_year": "إقفال السنة المالية وقفل الفترات المحاسبية",
     "act_reset_db": "تصفير الحركات التجريبية لقاعدة البيانات (إجراء حساس)",
     "act_manage_settings": "تعديل إعدادات المنشأة والبيانات الضريبية",
     "act_manage_users": "إدارة المستخدمين وتخصيص الصلاحيات الحرة (RBAC / Custom)",
 }
+
 
 ALL_PERMISSION_KEYS: List[str] = list(SYSTEM_MODULES.keys()) + list(SYSTEM_ACTIONS.keys())
 
@@ -464,11 +468,12 @@ def get_default_permissions_for_role(role: Any) -> Dict[str, bool]:
     if role_str == UserRole.AUDITOR.value:
         for k in [
             "mod_dashboard", "mod_cpa", "mod_assets_hr", "mod_control",
-            "mod_ledger", "mod_statements", "mod_audit_log", "mod_settings",
-            "act_cpa_profiles", "act_export_reports", "act_view_audit_logs"
+            "mod_ledger", "mod_statements", "mod_audit_log", "mod_system_activity", "mod_settings",
+            "act_cpa_profiles", "act_export_reports", "act_view_audit_logs", "act_view_system_activity"
         ]:
             base[k] = True
         return base
+
 
     if role_str == UserRole.SALES.value:
         for k in [
@@ -706,10 +711,215 @@ class AuditLog(Base):
     entry_hash = Column(String(64), nullable=True, index=True)
 
 
+class AuditLogArchive(Base):
+    """
+    جدول الأرشيف والتخزين البارد لسجلات التدقيق الرقابية القديمة (Cold Storage Audit Archive)
+    يحفظ السجلات الرقابية المؤرشفة مع كافة البصمات التشفيرية SHA-256 وسلسلة التتبع لحماية سرعة أداء القاعدة النشطة.
+    """
+    __tablename__ = "audit_logs_archive"
+
+    id = Column(Integer, primary_key=True, index=True)
+    table_name = Column(String(50), nullable=False, index=True)
+    record_id = Column(Integer, nullable=False, index=True)
+    action = Column(String(50), nullable=False, index=True)
+    user_id = Column(String(64), default="USR-001", nullable=False, index=True)
+    username = Column(String(100), default="admin", nullable=True, index=True)
+    performed_by = Column(String(150), default="مدير النظام (Admin)", nullable=True)
+    timestamp = Column(DateTime, nullable=False, index=True)
+    reference_number = Column(String(100), nullable=True, index=True)
+    financial_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=True)
+    old_values_json = Column(Text, nullable=True)
+    new_values_json = Column(Text, nullable=True)
+    details = Column(Text, nullable=True)
+    previous_hash = Column(String(64), default=AUDIT_GENESIS_HASH, nullable=False)
+    entry_hash = Column(String(64), nullable=True, index=True)
+
+    batch_id = Column(String(64), nullable=False, index=True)
+    archived_at = Column(DateTime, default=utc_now, nullable=False, index=True)
+    archived_by = Column(String(150), default="مدير النظام", nullable=False)
+
+
+class AuditArchiveManifest(Base):
+    """
+    جدول توثيق دفعة الأرشيف والتخزين البارد لسجلات التدقيق (Audit Archival Manifest & Seal)
+    يوثق معرف دفعة الأرشيف، تاريخ القطع، عدد السجلات، وحزمة الختم التشفيري SHA-256
+    """
+    __tablename__ = "audit_archive_manifests"
+
+    id = Column(Integer, primary_key=True, index=True)
+    batch_id = Column(String(64), unique=True, index=True, nullable=False)
+    archived_at = Column(DateTime, default=utc_now, nullable=False, index=True)
+    cutoff_date = Column(Date, nullable=False, index=True)
+    record_count = Column(Integer, default=0, nullable=False)
+    total_financial_volume = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    manifest_sha256 = Column(String(64), nullable=False)
+    archived_by = Column(String(150), default="مدير النظام", nullable=False)
+    notes = Column(Text, nullable=True)
+
+
+class AuditSecurityAlert(Base):
+    """
+    جدول تنبيهات الرقابة الأمنية والأنماط المشبوهة في سجل التدقيق (Audit Security Anomaly Alerts)
+    يرصد التعديلات المتتالية غير المعتادة، التلاعب بسلسلة التشفير، والعمليات خارج أوقات العمل
+    """
+    __tablename__ = "audit_security_alerts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    alert_type = Column(String(64), nullable=False, index=True)
+    severity = Column(String(32), default="MEDIUM", nullable=False, index=True)  # CRITICAL, HIGH, MEDIUM, LOW
+    title = Column(String(255), nullable=False)
+    description = Column(Text, nullable=False)
+    user_id = Column(String(64), nullable=True, index=True)
+    username = Column(String(100), nullable=True)
+    related_table = Column(String(64), nullable=True)
+    related_record_id = Column(Integer, nullable=True)
+    triggered_at = Column(DateTime, default=utc_now, nullable=False, index=True)
+    is_acknowledged = Column(Boolean, default=False, nullable=False)
+    acknowledged_by = Column(String(150), nullable=True)
+    acknowledged_at = Column(DateTime, nullable=True)
+    notification_sent = Column(Boolean, default=False, nullable=False)
+    notification_target = Column(String(255), nullable=True)
+    details_json = Column(Text, nullable=True)
+
+
+class AuditReportSchedule(Base):
+    """
+    جدول جدولة تقارير التدقيق الرقابي الدورية للمراجعين الخارجيين (Automated Audit Report Schedules)
+    يتيح الجدولة التلقائية الدورية مع إرسال التقارير بالبريد الإلكتروني بصيغة PDF مشفرة ومؤرخة
+    """
+    __tablename__ = "audit_report_schedules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    schedule_name = Column(String(150), nullable=False)
+    frequency = Column(String(32), default="WEEKLY", nullable=False)  # DAILY, WEEKLY, MONTHLY, QUARTERLY
+    recipient_emails = Column(Text, nullable=False)  # Comma-separated email addresses
+    report_type = Column(String(64), default="ZATCA_IMMUTABLE_PDF", nullable=False)
+    include_pdf = Column(Boolean, default=True, nullable=False)
+    include_json_manifest = Column(Boolean, default=True, nullable=False)
+    include_excel = Column(Boolean, default=True, nullable=False)
+    filter_transaction_type = Column(String(64), default="ALL", nullable=False)
+    min_financial_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    last_run_at = Column(DateTime, nullable=True)
+    next_run_at = Column(DateTime, nullable=True)
+    last_status = Column(String(32), default="PENDING", nullable=False)  # PENDING, SUCCESS, FAILED
+    last_status_message = Column(Text, nullable=True)
+    total_runs_count = Column(Integer, default=0, nullable=False)
+    template_id = Column(Integer, nullable=True)
+    created_by = Column(String(150), default="مدير النظام", nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class AuditReportTemplate(Base):
+    """
+    جدول قوالب تقارير التدقيق الرقابي المخصصة لمختلف الجهات الرقابية (Custom Audit Report Templates)
+    يتيح تحديد حقول البيانات الرقابية المشمولة ونصوص الإقرار وتخصيص التقارير لـ ZATCA أو SOCPA أو CMA
+    """
+    __tablename__ = "audit_report_templates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    template_name = Column(String(150), nullable=False)
+    regulatory_body = Column(String(64), default="ZATCA", nullable=False, index=True)  # ZATCA, SOCPA, CMA, TAX_AUTHORITY, INTERNAL_AUDIT, CUSTOM
+    description = Column(Text, nullable=True)
+    selected_fields_json = Column(Text, nullable=False)  # JSON list of field keys
+    filter_transaction_type = Column(String(64), default="ALL", nullable=False)
+    min_financial_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    only_modifications = Column(Boolean, default=False, nullable=False)
+    header_disclaimer = Column(Text, nullable=True)
+    auditor_signoff_text = Column(Text, nullable=True)
+    is_system_default = Column(Boolean, default=False, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_by = Column(String(150), default="مدير النظام", nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+
+
+def compute_annotation_hash(
+    audit_log_id: int,
+    auditor_id: str,
+    auditor_name: str,
+    category: str,
+    created_at: datetime,
+    annotation_text: str,
+) -> str:
+    """حساب البصمة التشفيرية SHA-256 للملاحظات والتعليقات الخاصة للمراجعين لضمان عدم التلاعب"""
+    ts_str = created_at.strftime("%Y-%m-%dT%H:%M:%S") if isinstance(created_at, datetime) else str(created_at)[:19]
+    raw = f"{audit_log_id}|{str(auditor_id).strip()}|{str(auditor_name).strip()}|{str(category).strip()}|{ts_str}|{str(annotation_text).strip()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+class AuditLogAnnotation(Base):
+    """
+    جدول الملاحظات والتعليقات الرقمية الخاصة للمراجعين القانونيين على سجلات التدقيق (Auditor Private Annotations)
+    يتيح للمراجعين المعتمدين إضافة ملاحظات وتوثيقات رقمية سرية غير قابلة للتعديل أو الحذف ومحمية بختم تشفيري SHA-256.
+    """
+    __tablename__ = "audit_log_annotations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    audit_log_id = Column(Integer, ForeignKey("audit_logs.id"), nullable=False, index=True)
+    auditor_id = Column(String(64), default="USR-001", nullable=False, index=True)
+    auditor_name = Column(String(150), default="المراجع القانوني", nullable=False)
+    annotation_text = Column(Text, nullable=False)
+    category = Column(String(50), default="INSPECTION_NOTE", nullable=False, index=True)
+    is_private = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False, index=True)
+    annotation_hash = Column(String(64), nullable=False, index=True)
+
+    audit_log = relationship("AuditLog")
+
+
+class UserLoginHistory(Base):
+    """
+    جدول تتبع وتوثيق سجل تسجيل دخول وخروج المستخدمين (User Login & Session History)
+    يوثق محاولات الدخول الناجحة والفاشلة وعمليات الخروج وعناوين IP والطابع الزمني
+    مكملاً لسجلات التدقيق المالي
+    """
+    __tablename__ = "user_login_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=True, index=True)
+    username = Column(String(100), nullable=False, index=True)
+    full_name_ar = Column(String(255), nullable=True)
+    timestamp = Column(DateTime, default=utc_now, nullable=False, index=True)
+    status = Column(String(50), nullable=False, index=True)  # SUCCESS, FAILED_BAD_PIN, FAILED_USER_LOCKED, FAILED_USER_NOT_FOUND, LOGOUT, PIN_CHANGE
+    ip_address = Column(String(100), default="127.0.0.1", nullable=False)
+    user_agent = Column(String(255), default="Web Client / Streamlit", nullable=True)
+    session_id = Column(String(100), nullable=True)
+    failure_reason = Column(String(255), nullable=True)
+    details = Column(Text, nullable=True)
+
+
+class ConfigurationChangeLog(Base):
+    """
+    جدول تتبع وتوثيق تغييرات الإعدادات والتهيئة وسياسات النظام (System Configuration & Policy Changes)
+    يوثق أي تعديل على إعدادات المنشأة، الضرائب، صلاحيات المستخدمين، إقفال الفترات، وقوالب الأدوار
+    مع حفظ القيم قبل وبعد التعديل (Before/After State Diff)
+    """
+    __tablename__ = "configuration_change_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=utc_now, nullable=False, index=True)
+    user_id = Column(String(50), nullable=True, index=True)
+    username = Column(String(100), nullable=False)
+    performed_by = Column(String(255), nullable=False)
+    config_category = Column(String(100), nullable=False, index=True)  # COMPANY_SETTINGS, USER_PERMISSIONS, USER_ACCOUNTS, CUSTOM_ROLES, FISCAL_PERIODS, AUDIT_SCHEDULES, REPORT_TEMPLATES, SECURITY_POLICY
+    target_item = Column(String(200), nullable=False)  # e.g., "CompanySettings#1", "UserPermissions#USR-002"
+    action_type = Column(String(50), nullable=False)  # UPDATE, CREATE, DELETE, LOCK_PERIOD, PERMISSION_GRANT, PIN_CHANGE
+    old_values_json = Column(Text, nullable=True)
+    new_values_json = Column(Text, nullable=True)
+    diff_summary = Column(Text, nullable=True)
+    change_reason = Column(String(255), nullable=True)
+    ip_address = Column(String(100), default="127.0.0.1", nullable=False)
+    details = Column(Text, nullable=True)
+
+
 
 # =============================================================================
 # 4. جداول العملاء والموردين والأصناف وحركة المخزون (Master Data & Inventory)
 # =============================================================================
+
 
 class Customer(Base):
     """جدول العملاء التجاريين والأفراد"""
@@ -1299,11 +1509,35 @@ def _prevent_audit_log_update(mapper, connection, target: AuditLog):
     )
 
 
-@event.listens_for(AuditLog, "before_delete")
-def _prevent_audit_log_delete(mapper, connection, target: AuditLog):
-    """منع حذف أي سجل تدقيق على مستوى ORM نهائياً (Read-Only Compliance)"""
+
+
+
+@event.listens_for(AuditLogAnnotation, "before_insert")
+def _audit_annotation_before_insert(mapper, connection, target: AuditLogAnnotation):
+    if target.created_at is None:
+        target.created_at = utc_now()
+    if not target.annotation_hash:
+        target.annotation_hash = compute_annotation_hash(
+            audit_log_id=target.audit_log_id,
+            auditor_id=target.auditor_id or "USR-001",
+            auditor_name=target.auditor_name or "المراجع القانوني",
+            category=target.category or "INSPECTION_NOTE",
+            created_at=target.created_at,
+            annotation_text=target.annotation_text or "",
+        )
+
+
+@event.listens_for(AuditLogAnnotation, "before_update")
+def _prevent_annotation_update(mapper, connection, target: AuditLogAnnotation):
     raise AuditLogReadOnlyError(
-        "ZATCA_AUDIT_LOG_READ_ONLY: سجل التدقيق الرقابي للقراءة والإضافة فقط (Read-Only) ويُمنع حذف أي سجل رقابي مسجل."
+        "ZATCA_ANNOTATION_READ_ONLY: ملاحظات المراجعين القانونيين مبرمة وقابلة للقراءة والإضافة فقط ولا يمكن تعديلها."
+    )
+
+
+@event.listens_for(AuditLogAnnotation, "before_delete")
+def _prevent_annotation_delete(mapper, connection, target: AuditLogAnnotation):
+    raise AuditLogReadOnlyError(
+        "ZATCA_ANNOTATION_READ_ONLY: ملاحظات المراجعين القانونيين مبرمة وقابلة للقراءة والإضافة فقط ولا يمكن حذفها."
     )
 
 

@@ -1034,3 +1034,29 @@ class ExportService:
 
         output.seek(0)
         return output.getvalue()
+
+    @staticmethod
+    def generate_financial_statements_csv(
+        report: Dict[str, Any],
+        company_name: str = "شركة ميزان برو التجارية",
+        trial_balance_df: Optional[pd.DataFrame] = None
+    ) -> bytes:
+        """تصدير القوائم المالية بصيغة CSV غير مدمجة ومفصلة للتحليل الخارجي"""
+        from export_service import CSVExportService
+        return CSVExportService.generate_financial_statements_csv(
+            report=report,
+            company_name=company_name,
+            tb_df=trial_balance_df
+        )
+
+    @staticmethod
+    def generate_trial_balance_csv(
+        trial_balance_df: pd.DataFrame,
+        company_name: str = "شركة ميزان برو التجارية"
+    ) -> bytes:
+        """تصدير ميزان المراجعة بصيغة CSV غير مدمجة للتحليل الخارجي"""
+        from export_service import CSVExportService
+        return CSVExportService.generate_trial_balance_csv(
+            tb_df=trial_balance_df,
+            company_name=company_name
+        )

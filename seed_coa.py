@@ -7,6 +7,7 @@ MizanPro - Standard Chart of Accounts, Safe Auto-Migration & Master Data Seeder
 import json
 import os
 from datetime import date
+from decimal import Decimal
 from typing import Optional
 from sqlalchemy import text, inspect
 from database import engine, Base, SessionLocal, ACTIVE_DB_PATH
@@ -16,6 +17,8 @@ from models import (
     Supplier, Product, FixedAsset, Employee, AppUser, UserRole,
     CustomRoleTemplate, Warehouse, WarehouseStock, JournalEntry, JournalLine,
     InventoryTransaction, InventoryTxType, DocumentType, EntryStatus, AuditLog,
+    AuditSecurityAlert, AuditReportSchedule, AuditReportTemplate,
+    UserLoginHistory, ConfigurationChangeLog,
     get_default_permissions_for_role, hash_pin_code, verify_pin_code,
     generate_random_pin, LEGACY_COMPROMISED_PINS, PIN_HASH_PREFIX,
     AUDIT_GENESIS_HASH, compute_audit_entry_hash, resolve_audit_user_identity
@@ -891,6 +894,64 @@ def init_database_and_seed(seed_demo_data: bool = True):
                     emp_code="EMP-003", name_ar="سلمان بن محمد الدوسري", job_title="أمين مستودع ومشتريات",
                     nationality="سعودي", is_saudi=True, join_date=date(2024, 3, 1),
                     basic_salary=6000.0, housing_allowance=1500.0, transport_allowance=500.0, other_allowance=0.0
+                ),
+            ])
+            db.commit()
+
+        # 8.ب زراعة قوالب تقارير التدقيق الرقابي القياسية لمختلف الجهات الرقابية (ZATCA, SOCPA, CMA)
+        if db.query(AuditReportTemplate).count() == 0:
+            db.add_all([
+                AuditReportTemplate(
+                    template_name="قالب فحص الفوترة والامتثال الضريبي المعتمد (ZATCA Phase 2 Official Audit Trail)",
+                    regulatory_body="ZATCA",
+                    description="قالب مصمم وفق المتطلبات الفنية الإلزامية لمفتشي هيئة الزكاة والضريبة والجمارك؛ يركز على الفواتير والإشعارات والبصمة التشفيرية والهاش التراكمي.",
+                    selected_fields_json=json.dumps([
+                        "timestamp", "table_name", "action", "reference_number",
+                        "financial_amount", "performed_by", "previous_hash", "entry_hash", "details"
+                    ], ensure_ascii=False),
+                    filter_transaction_type="ALL",
+                    min_financial_amount=Decimal("0.00"),
+                    only_modifications=False,
+                    header_disclaimer="تقرير سجل التدقيق الرقابي للقراءة فقط المعتمد وفق اشتراطات لائحة الفوترة الإلكترونية بالمملكة العربية السعودية.",
+                    auditor_signoff_text="تم فحص السجل ومطابقة تسلسل البصمات التشفيرية SHA-256 للمرحلة الثانية دون أي استثناء.",
+                    is_system_default=True,
+                    is_active=True,
+                    created_by="النظام (System Core)",
+                ),
+                AuditReportTemplate(
+                    template_name="قالب المراجعة القانونية والقوائم المالية (SOCPA / IFRS Statutory CPA Audit)",
+                    regulatory_body="SOCPA",
+                    description="قالب معتمد لمكاتب المحاسبة والمراجعة القانونية وفق معايير الهيئة السعودية للمراجعين والمحاسبين؛ يتضمن القيم قبل وبعد التعديل وتوثيق قيود التسوية.",
+                    selected_fields_json=json.dumps([
+                        "id", "timestamp", "table_name", "action", "reference_number",
+                        "financial_amount", "old_values", "new_values", "diff_summary",
+                        "performed_by", "entry_hash", "details"
+                    ], ensure_ascii=False),
+                    filter_transaction_type="ALL",
+                    min_financial_amount=Decimal("0.00"),
+                    only_modifications=False,
+                    header_disclaimer="تقرير فحص مسار التدقيق المستقل وفق المعايير الدولية للمراجعة (ISA) المعتمدة في المملكة العربية السعودية من SOCPA.",
+                    auditor_signoff_text="نقر نحن المراجعين القانونيين بمطابقة البيانات الواردة مع دفاتر وسجلات المنشأة النظامية.",
+                    is_system_default=True,
+                    is_active=True,
+                    created_by="النظام (System Core)",
+                ),
+                AuditReportTemplate(
+                    template_name="قالب الحوكمة وإدارة المخاطر والرقابة الداخلية (CMA & Governance Committee)",
+                    regulatory_body="CMA",
+                    description="قالب مخصص للجان المراجعة وهيئة السوق المالية؛ يركز على رصد العمليات الجسيمة، أوقات التنفيذ، وتتبع صلاحيات المستخدمين.",
+                    selected_fields_json=json.dumps([
+                        "id", "timestamp", "action", "user_id", "username", "performed_by",
+                        "reference_number", "financial_amount", "diff_summary", "chain_verification", "details"
+                    ], ensure_ascii=False),
+                    filter_transaction_type="ALL",
+                    min_financial_amount=Decimal("10000.00"),
+                    only_modifications=True,
+                    header_disclaimer="تقرير الحوكمة والامتثال الرقابي الداخلي المرفوع للجنة المراجعة ومجلس الإدارة.",
+                    auditor_signoff_text="تم إعداد التقرير لمراجعة الامتثال للائحة حوكمة الشركات وإدارة المخاطر التشغيلية.",
+                    is_system_default=True,
+                    is_active=True,
+                    created_by="النظام (System Core)",
                 ),
             ])
             db.commit()

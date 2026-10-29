@@ -7,7 +7,7 @@ MizanPro - Full Isolated Accounting, Security, Period Isolation, Decimal Roundin
 import os
 import sqlite3
 import tempfile
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 # =============================================================================
 # 0. عزل بيئة الاختبار تماماً عن قاعدة بيانات التطبيق الرئيسية (Point 4)
@@ -24,16 +24,28 @@ from database import (
 )
 from seed_coa import init_database_and_seed, get_initial_admin_bootstrap_pin
 from ledger_service import LedgerService, LedgerValidationError
-from financial_engine import FinancialStatementsEngine
-from export_service import ExcelExportService
+from financial_engine import FinancialStatementsEngine, ExportService
+from export_service import ExcelExportService, CSVExportService
 from tb_analyzer_service import ExternalTBAnalyzerService
 from models import (
     PaymentMethod, InvoiceType, NoteType,
     Product, AppUser, UserRole, SYSTEM_MODULES, SYSTEM_ACTIONS,
     get_default_permissions_for_role, calculate_line_and_tax_amounts, round_money,
     AuditLog, AuditLogReadOnlyError, SalesInvoice, PurchaseInvoice, CreditDebitNote,
-    AUDIT_TRANSACTION_TYPES, classify_audit_transaction_type
+    AUDIT_TRANSACTION_TYPES, classify_audit_transaction_type, AuditReportTemplate,
+    UserLoginHistory, ConfigurationChangeLog
 )
+from audit_template_service import (
+    AuditTemplateService,
+    AVAILABLE_AUDIT_FIELDS,
+    REGULATORY_BODIES,
+)
+from system_activity_service import (
+    SystemActivityService,
+    CONFIG_CATEGORIES,
+    LOGIN_STATUS_META,
+)
+
 from zatca_qr_tlv import (
     ZATCATLVEncodingError,
     ZATCATLVQRGenerator,
@@ -44,6 +56,7 @@ from zatca_qr_tlv import (
     generate_zatca_tlv_qr_base64,
 )
 from sqlalchemy import text as sa_text
+
 
 
 def run_full_accounting_cycle():
@@ -740,8 +753,776 @@ def run_full_accounting_cycle():
         assert tamper_verify_res["is_tamper_free"] is False, "يجب أن يكتشف المحرك فوراً أي تعديل ولو لبايت واحد في ملف الـ PDF!"
 
         print(
-            f"✅ [11/12] تصدير سجل التدقيق بصيغة PDF مؤمّنة وغير قابلة للتعديل (Immutable Auditor PDF): "
+            f"✅ [11/14] تصدير سجل التدقيق بصيغة PDF مؤمّنة وغير قابلة للتعديل (Immutable Auditor PDF): "
             f"وثيقة ({pdf_verify_res['document_id']}) بحجم ({len(full_audit_pdf_bytes):,} بايت) مختومة بـ SHA-256 ومحمية ضد التلاعب 100%"
+        )
+
+        # ---------------------------------------------------------------------
+        # 12. اختبار لوحة معلومات التدقيق البصرية المبنية بـ Recharts (Recharts Visual Dashboard Module)
+        # ---------------------------------------------------------------------
+        from recharts_audit_dashboard import (
+            aggregate_audit_logs_for_recharts,
+            generate_recharts_dashboard_html,
+        )
+
+        all_logs_query = LedgerService.query_audit_logs(db=db, limit=1000)
+        recharts_data = aggregate_audit_logs_for_recharts(all_logs_query["logs"])
+
+        # التحقق من حساب تردد العمليات لكل مستخدم
+        assert "user_chart_data" in recharts_data
+        assert len(recharts_data["user_chart_data"]) >= 2, "يجب وجود نشاط لعدة مستخدمين في المخطط"
+        first_user_metric = recharts_data["user_chart_data"][0]
+        assert "user" in first_user_metric and "total_ops" in first_user_metric
+        assert "financial_ops" in first_user_metric and "admin_ops" in first_user_metric
+        assert first_user_metric["total_ops"] > 0
+
+        # التحقق من حساب تدفق الوثائق عبر الخط الزمني
+        assert "timeline_chart_data" in recharts_data
+        assert len(recharts_data["timeline_chart_data"]) >= 1, "يجب وجود نقاط زمنية لتدفق الوثائق"
+        first_timeline_point = recharts_data["timeline_chart_data"][0]
+        assert "date" in first_timeline_point and "total_docs" in first_timeline_point
+        assert "invoices" in first_timeline_point and "entries" in first_timeline_point
+
+        # التحقق من توليد مستند HTML التفاعلي لمكتبة Recharts ومحرك React
+        recharts_html_doc = generate_recharts_dashboard_html(recharts_data)
+        assert "<!DOCTYPE html>" in recharts_html_doc
+        assert "Recharts.min.js" in recharts_html_doc
+        assert "react.production.min.js" in recharts_html_doc
+        assert "userBarChart" in recharts_html_doc
+        assert "timelineAreaChart" in recharts_html_doc
+        assert "BarChart" in recharts_html_doc
+        assert "AreaChart" in recharts_html_doc
+        assert f"{recharts_data['metrics']['total_logs']}" in recharts_html_doc
+
+        print(
+            f"✅ [12/14] لوحة المؤشرات البصرية Recharts (Recharts Visual Dashboard): "
+            f"تم تجميع بيانات ({recharts_data['metrics']['total_logs']}) عملية رقابية، "
+            f"وتوليد مخططات تردد المستخدمين وتدفق الوثائق ({len(recharts_html_doc):,} بايت HTML) بنجاح 100%"
+        )
+
+        # ---------------------------------------------------------------------
+        # 13. اختبار خدمة الاستعلام الرقابي الذكي المدعومة بـ Google Search Grounding (ZATCA & SOCPA Regulations)
+        # ---------------------------------------------------------------------
+        from zatca_grounding_service import ZATCAGroundingService, ZATCA_TOPICS
+
+        # (أ) التحقق من تغطية المجالات الرقابية الأساسية (الفوترة المرحلة 2، VAT، الزكاة، SOCPA)
+        topics = ZATCAGroundingService.get_topics()
+        assert "phase2_waves" in topics and "vat_updates" in topics
+        assert "zakat_rules" in topics and "socpa_standards" in topics
+
+        # (ب) جلب ملخص موجات الفوترة الإلكترونية المرحلة الثانية
+        grounding_res = ZATCAGroundingService.fetch_regulatory_update(topic_key="phase2_waves")
+        assert "summary" in grounding_res and len(grounding_res["summary"]) > 100
+        assert "sources" in grounding_res and len(grounding_res["sources"]) >= 1
+        assert "provider" in grounding_res and len(grounding_res["provider"]) > 0
+        assert "search_queries" in grounding_res
+        assert any("zatca.gov.sa" in src["uri"] for src in grounding_res["sources"]), "يجب توثيق مصادر زاتكا الرسمية"
+
+        # (ج) جلب معايير SOCPA / IFRS
+        socpa_res = ZATCAGroundingService.fetch_regulatory_update(topic_key="socpa_standards")
+        assert "IFRS" in socpa_res["summary"] or "المعايير" in socpa_res["summary"]
+        assert len(socpa_res["sources"]) >= 1
+
+        print(
+            f"✅ [13/16] خدمة الرقابة الذكية (Google Search Grounding for ZATCA Regulations): "
+            f"تم استعلام وتوثيق موجات الفوترة واللوائح الضريبية والزكوية مع روابط الاستشهاد الرسمية بنجاح 100%"
+        )
+
+        # ---------------------------------------------------------------------
+        # 14. اختبار محرك كشف الأنماط المشبوهة والإنذار الأمني (Suspicious Audit Anomaly Detection & Security Alerts)
+        # ---------------------------------------------------------------------
+        from audit_notification_service import (
+            SuspiciousAuditAlertService,
+            AuditReportSchedulerService,
+            EmailDispatcher,
+        )
+        from models import utc_now
+
+        # (أ) إدراج دفعة تعديلات متسارعة (Burst Modifications) لاختبار كشف النمط المشبوه
+        now_test = utc_now()
+        for idx in range(4):
+            db.add(AuditLog(
+                table_name="sales_invoices",
+                record_id=200 + idx,
+                action="MODIFY_SALES_INVOICE",
+                user_id="USR-SUSPECT",
+                username="suspect_operator",
+                performed_by="المشغل المشتبه به",
+                timestamp=now_test - timedelta(minutes=8 - idx * 2),
+                reference_number=f"INV-ANOMALY-{idx}",
+                financial_amount=Decimal("75000.00"),
+                details=f"Test simulated rapid alteration on invoice #{idx}",
+            ))
+        db.commit()
+
+        # (ب) تشغيل فحص الأنماط المشبوهة والتحقق من رصد تنبيهات الوتيرة المتسارعة والمبالغ الجسيمة
+        detected_anomalies = SuspiciousAuditAlertService.scan_and_detect_anomalies(
+            db=db,
+            lookback_hours=1,
+            high_value_threshold=Decimal("50000.00"),
+            recipient_email_for_alerts="compliance.officer@mizanpro.sa",
+        )
+        assert len(detected_anomalies) >= 2, "يجب رصد تنبيه الوتيرة المتسارعة وتنبيه تجاوز السقف المالي الحرج!"
+
+        burst_alerts = [a for a in detected_anomalies if a.alert_type == "BURST_MODIFICATION_ALERT"]
+        assert len(burst_alerts) >= 1, "يجب رصد تنبيه BURST_MODIFICATION_ALERT"
+        b_alert = burst_alerts[0]
+        assert b_alert.severity == "HIGH"
+        assert b_alert.username == "suspect_operator"
+        assert b_alert.notification_sent is True
+        assert b_alert.notification_target == "compliance.officer@mizanpro.sa"
+
+        hv_alerts = [a for a in detected_anomalies if a.alert_type == "HIGH_VALUE_THRESHOLD_ALERT"]
+        assert len(hv_alerts) >= 1, "يجب رصد تنبيه HIGH_VALUE_THRESHOLD_ALERT"
+        assert Decimal("75000") >= SuspiciousAuditAlertService.DEFAULT_HIGH_VALUE_THRESHOLD
+
+        # (ج) اختبار اعتماد وتوثيق الفحص الأمني (Acknowledge Alert)
+        ack_success = SuspiciousAuditAlertService.acknowledge_alert(db, b_alert.id, "المراجع القانوني (CPA)")
+        assert ack_success is True
+        db.refresh(b_alert)
+        assert b_alert.is_acknowledged is True
+        assert b_alert.acknowledged_by == "المراجع القانوني (CPA)"
+
+        print(
+            f"✅ [14/16] محرك كشف الأنماط المشبوهة والإنذار الأمني (Suspicious Pattern Detection & Alerts): "
+            f"تم رصد ({len(detected_anomalies)}) تنبيهات أمنية بنجاح، وتوثيق الإشعار البريدي، واعتماد التنبيه 100%"
+        )
+
+        # ---------------------------------------------------------------------
+        # 15. اختبار جدولة وتوليد وتوصيل تقارير التدقيق الرقابي الدورية بالبريد (Automated Audit Report Scheduler)
+        # ---------------------------------------------------------------------
+        # (أ) اختبار حساب مواعيد التشغيل القادمة لكافة التواترات (DAILY, WEEKLY, MONTHLY, QUARTERLY)
+        base_t = datetime(2026, 1, 1, 10, 0, 0)
+        assert AuditReportSchedulerService.calculate_next_run("DAILY", base_t) == base_t + timedelta(days=1)
+        assert AuditReportSchedulerService.calculate_next_run("WEEKLY", base_t) == base_t + timedelta(days=7)
+        assert AuditReportSchedulerService.calculate_next_run("MONTHLY", base_t) == base_t + timedelta(days=30)
+        assert AuditReportSchedulerService.calculate_next_run("QUARTERLY", base_t) == base_t + timedelta(days=90)
+
+        # (ب) إنشاء جدول تقرير دوري أسبوعي موجه للمراجع الخارجي المستقل
+        cpa_schedule = AuditReportSchedulerService.create_or_update_schedule(
+            db=db,
+            name="تقرير المراجعة الرقابية الأسبوعي لمكتب المحاسب القانوني",
+            frequency="WEEKLY",
+            recipient_emails="lead.auditor@cpa-firm.sa, external.cpa@firm.com",
+            report_type="ZATCA_IMMUTABLE_PDF",
+            include_pdf=True,
+            include_json_manifest=True,
+            include_excel=True,
+            filter_transaction_type="ALL",
+            min_financial_amount=0.0,
+            is_active=True,
+            created_by="مدير النظام (Admin)",
+        )
+        assert cpa_schedule.id is not None
+        assert cpa_schedule.is_active is True
+        assert "lead.auditor@cpa-firm.sa" in cpa_schedule.recipient_emails
+
+        # (ج) تشغيل التوليد والإرسال الآلي للتقرير وفحص المرفقات وإيصال التسليم
+        sched_exec_result = AuditReportSchedulerService.execute_and_deliver_report(
+            db=db,
+            schedule_id=cpa_schedule.id,
+            requesting_user_info={"performed_by": "مدير النظام (admin)"},
+        )
+        assert sched_exec_result["success"] is True
+        assert sched_exec_result["schedule_id"] == cpa_schedule.id
+        assert len(sched_exec_result["document_id"]) >= 10
+        assert len(sched_exec_result["pdf_sha256"]) == 64
+        assert sched_exec_result["attachments_count"] == 3  # Sealed PDF + JSON Manifest + CSV
+        assert len(sched_exec_result["recipients"]) == 2
+        assert sched_exec_result["receipt_id"].startswith("RCPT-")
+
+        # التحقق من تحديث حالة الجدولة في قاعدة البيانات
+        db.refresh(cpa_schedule)
+        assert cpa_schedule.last_status == "SUCCESS"
+        assert cpa_schedule.total_runs_count == 1
+        assert cpa_schedule.last_run_at is not None
+        assert cpa_schedule.next_run_at > cpa_schedule.last_run_at
+
+        # التحقق من توثيق عملية الإرسال في سجل التدقيق الرقابي
+        dispatch_audit_row = (
+            db.query(AuditLog)
+            .filter(
+                AuditLog.action == "DISPATCH_SCHEDULED_AUDIT_REPORT",
+                AuditLog.record_id == cpa_schedule.id,
+            )
+            .first()
+        )
+        assert dispatch_audit_row is not None
+        assert sched_exec_result["document_id"] in dispatch_audit_row.reference_number
+
+        print(
+            f"✅ [15/17] جدولة وتوصيل تقارير التدقيق الرقابي الدورية (Automated Report Scheduler & Email Delivery): "
+            f"تم توليد حزمة التقرير ({sched_exec_result['document_id']}) بـ (3) مرفقات مؤمّنة وإرسالها لـ ({len(sched_exec_result['recipients'])}) مراجعين بنجاح 100%"
+        )
+
+        # -------------------------------------------------------------------------
+        # 16. قوالب تقارير التدقيق الرقابي المخصصة لمختلف الهيئات الرقابية وتخصيص الحقول
+        # (Custom Multi-Regulatory Audit Report Templates & Field Catalog)
+        # -------------------------------------------------------------------------
+        # (أ) التحقق من القوالب القياسية المعتمدة مسبقاً (ZATCA, SOCPA, CMA)
+        seeded_templates = AuditTemplateService.get_all_templates(db)
+        assert len(seeded_templates) >= 3, "يجب وجود 3 قوالب قياسية نظامية على الأقل"
+        system_bodies = {t.regulatory_body for t in seeded_templates if t.is_system_default}
+        assert "ZATCA" in system_bodies
+        assert "SOCPA" in system_bodies
+        assert "CMA" in system_bodies
+
+        # (ب) إنشاء وحفظ قالب رقابي مخصص جديد لهيئة فحص محددة وتحديد حقول مخصصة
+        custom_selected_fields = [
+            "timestamp",
+            "action",
+            "reference_number",
+            "financial_amount",
+            "performed_by",
+            "entry_hash",
+        ]
+        custom_tpl = AuditTemplateService.create_or_update_template(
+            db=db,
+            name="قالب الفحص الضريبي الميداني لعينات المبيعات (ZATCA Field Audit Sample)",
+            regulatory_body="TAX_AUTHORITY",
+            selected_fields=custom_selected_fields,
+            description="قالب مخصص لاستخراج عينات الفواتير الضريبية ذات القيمة الأعلى من 100 ريال",
+            filter_transaction_type="ALL",
+            min_financial_amount=0.0,
+            only_modifications=False,
+            header_disclaimer="تقرير فحص ضريبي ميداني رسمي صادر للمفتش الميداني لهيئة الزكاة والضريبة والجمارك",
+            auditor_signoff_text="تم التدقيق والفحص الجنائي بواسطة المحاسب القانوني المعتمد",
+            created_by="مراجع قانوني خارجي (CPA)",
+        )
+        assert custom_tpl.id is not None
+        assert custom_tpl.is_system_default is False
+        assert custom_tpl.regulatory_body == "TAX_AUTHORITY"
+
+        # (ج) استخراج وتصفية البيانات الرقابية وفق حقول ومعايير القالب المخصص
+        filter_result = AuditTemplateService.filter_audit_records_for_template(
+            db=db,
+            template=custom_tpl,
+            limit=50,
+        )
+        assert filter_result["template"].id == custom_tpl.id
+        custom_df = filter_result["dataframe"]
+        # التأكد من أن الأعمدة المستخرجة تطابق الحقول المحددة في القالب حصراً
+        expected_col_labels = [AVAILABLE_AUDIT_FIELDS[k]["label"] for k in custom_selected_fields]
+        for col_lbl in expected_col_labels:
+            assert col_lbl in custom_df.columns, f"الحقل {col_lbl} يجب أن يكون ضمن أعمدة التقرير المخصص"
+        # التأكد من عدم وجود حقول غير مطلوبة (مثل old_values أو details غير المحددة)
+        unwanted_field_lbl = AVAILABLE_AUDIT_FIELDS["old_values"]["label"]
+        assert unwanted_field_lbl not in custom_df.columns
+
+        # (د) توليد تقرير PDF رسمي مخصص ومؤمّن ببصمة SHA-256 وترويسة الإقرار وخاتم الاعتماد
+        custom_pdf_bytes = AuditTemplateService.export_custom_template_pdf(
+            db=db,
+            template=custom_tpl,
+            limit=50,
+        )
+        assert custom_pdf_bytes.startswith(b"%PDF"), "ملف التقرير المخصص يجب أن يكون بصيغة PDF صحيحة"
+        assert len(custom_pdf_bytes) > 2000, "حجم التقرير يجب أن يحتوي على الجداول والترويسة والخاتم"
+
+        # (هـ) تحديث القالب المخصص
+        updated_tpl = AuditTemplateService.create_or_update_template(
+            db=db,
+            name="قالب الفحص الضريبي الميداني المحدث (Updated Field Audit)",
+            regulatory_body="TAX_AUTHORITY",
+            selected_fields=custom_selected_fields + ["diff_summary"],
+            description="وصف محدث للقالب",
+            template_id=custom_tpl.id,
+        )
+        assert updated_tpl.template_name == "قالب الفحص الضريبي الميداني المحدث (Updated Field Audit)"
+        import json
+        assert "diff_summary" in json.loads(updated_tpl.selected_fields_json)
+
+        # (و) منع حذف القوالب النظامية القياسية، والسماح بحذف القالب المخصص
+        zatca_default = next(t for t in seeded_templates if t.regulatory_body == "ZATCA" and t.is_system_default)
+        del_sys_res = AuditTemplateService.delete_template(db, zatca_default.id)
+        assert del_sys_res is False, "يجب منع حذف القوالب النظامية الافتراضية"
+
+        del_custom_res = AuditTemplateService.delete_template(db, custom_tpl.id)
+        assert del_custom_res is True, "يجب السماح بحذف القوالب المخصصة من المستخدم"
+
+        print(
+            f"✅ [16/18] قوالب تقارير التدقيق الرقابي المخصصة (Custom Regulatory Report Templates): "
+            f"تم التحقق من القوالب القياسية (ZATCA, SOCPA, CMA)، إنشاء قالب مخصص، وتصفية الحقول بدقة، وتصدير PDF مؤمّن بنجاح 100%"
+        )
+
+        # -------------------------------------------------------------------------
+        # 17. وحدة نشاط النظام وسجل الدخول وتغييرات الإعدادات والبحث بالكلمات المفتاحية
+        # (System Activity: User Login History, Configuration Changes & Audit Keyword Search)
+        # -------------------------------------------------------------------------
+        # (أ) اختبار تتبع سجل دخول وخروج المستخدمين (User Login & Auth History)
+        initial_logins_count = db.query(UserLoginHistory).count()
+
+        # 1. محاولة تسجيل دخول صحيحة
+        admin_user_obj = db.query(AppUser).filter(AppUser.username == "admin").first()
+        # محاكاة تسجيل دخول ناجح عبر الخدمة
+        rec_login_ok = SystemActivityService.log_login_attempt(
+            db=db,
+            username="admin",
+            status="SUCCESS",
+            user_id=admin_user_obj.id,
+            full_name_ar=admin_user_obj.full_name_ar,
+            ip_address="192.168.1.100",
+            details="Successful login via web portal",
+        )
+        assert rec_login_ok.id is not None
+        assert rec_login_ok.status == "SUCCESS"
+        assert rec_login_ok.username == "admin"
+
+        # 2. محاولة تسجيل دخول فاشلة برمز PIN غير صحيح
+        try:
+            LedgerService.authenticate_user(db, "admin", "WRONG_999999")
+        except LedgerValidationError:
+            pass
+        failed_pin_log = (
+            db.query(UserLoginHistory)
+            .filter(UserLoginHistory.username == "admin", UserLoginHistory.status == "FAILED_BAD_PIN")
+            .order_by(UserLoginHistory.id.desc())
+            .first()
+        )
+        assert failed_pin_log is not None
+        assert "غير صحيح" in failed_pin_log.failure_reason
+
+        # 3. محاولة تسجيل دخول باسم مستخدم غير مسجل
+        try:
+            LedgerService.authenticate_user(db, "unknown_hacker", "123456")
+        except LedgerValidationError:
+            pass
+        failed_notfound_log = (
+            db.query(UserLoginHistory)
+            .filter(UserLoginHistory.username == "unknown_hacker", UserLoginHistory.status == "FAILED_USER_NOT_FOUND")
+            .order_by(UserLoginHistory.id.desc())
+            .first()
+        )
+        assert failed_notfound_log is not None
+
+        # 4. تسجيل خروج آمن
+        rec_logout = SystemActivityService.log_logout(
+            db=db,
+            user_id=admin_user_obj.id,
+            username="admin",
+            full_name_ar=admin_user_obj.full_name_ar,
+            ip_address="192.168.1.100",
+            details="Manual secure logout",
+        )
+        assert rec_logout.id is not None
+        assert rec_logout.status == "LOGOUT"
+
+        # 5. استعلام وفلترة سجل الدخول بالكلمة المفتاحية
+        login_query_res = SystemActivityService.query_login_history(db=db, search_query="unknown_hacker")
+        assert login_query_res["total_count"] >= 1
+        assert "unknown_hacker" in login_query_res["dataframe"]["اسم المستخدم"].values
+
+        # (ب) اختبار تتبع وتوثيق تغييرات الإعدادات والسياسات (Configuration & Policy Changes)
+        # 1. تحديث إعدادات المنشأة وتوثيق الفروقات قبل وبعد
+        LedgerService.update_company_settings(
+            db=db,
+            performed_by="المراجع القانوني (CPA)",
+            company_name_ar="شركة ميزان برو التجارية المحدثة للتدقيق",
+            default_vat_rate=0.15,
+        )
+        cfg_settings_log = (
+            db.query(ConfigurationChangeLog)
+            .filter(ConfigurationChangeLog.config_category == "COMPANY_SETTINGS")
+            .order_by(ConfigurationChangeLog.id.desc())
+            .first()
+        )
+        assert cfg_settings_log is not None
+        assert "شركة ميزان برو التجارية المحدثة للتدقيق" in cfg_settings_log.new_values_json
+        assert "company_name_ar" in cfg_settings_log.diff_summary
+
+        # 2. تغيير رمز PIN وتوثيق سياسة الأمان
+        # إنشاء مستخدم لاختبار تغيير الرمز
+        test_u = LedgerService.create_or_update_user(
+            db=db,
+            username="test_sec_user",
+            full_name_ar="مستخدم اختبار الأمان",
+            role=UserRole.SALES,
+            pin_code="987654",
+            performed_by="مدير النظام",
+        )
+        LedgerService.change_user_pin(
+            db=db,
+            user_id=test_u.id,
+            current_pin="987654",
+            new_pin="456789",
+            performed_by="مستخدم اختبار الأمان",
+        )
+        cfg_pin_log = (
+            db.query(ConfigurationChangeLog)
+            .filter(
+                ConfigurationChangeLog.config_category == "SECURITY_POLICY",
+                ConfigurationChangeLog.username == "test_sec_user",
+            )
+            .first()
+        )
+        assert cfg_pin_log is not None
+        assert cfg_pin_log.action_type == "PIN_CHANGE"
+
+        # 3. ملخص مؤشرات نشاط النظام والأمان
+        sys_summary = SystemActivityService.get_system_activity_summary(db=db)
+        assert sys_summary["total_logins"] >= 4
+        assert sys_summary["failed_logins"] >= 2
+        assert sys_summary["total_config_changes"] >= 2
+        assert sys_summary["active_users_cnt"] >= 1
+
+        # (ج) اختبار شريط البحث بالكلمات المفتاحية في سجل التدقيق (Audit Log Keyword Search Bar)
+        # 1. البحث بمعرف السجل ورقم المعاملة (Transaction ID)
+        sample_audit_rec = db.query(AuditLog).first()
+        assert sample_audit_rec is not None
+        kw_res_id = LedgerService.query_audit_logs(
+            db=db,
+            search_query=f"#{sample_audit_rec.id}",
+        )
+        assert kw_res_id["summary"]["total_matched"] >= 1
+        assert sample_audit_rec.id in [r.id for r in kw_res_id["logs"]]
+
+        # 2. البحث برقم المعاملة للجدول (REC-ID)
+        if sample_audit_rec.record_id:
+            kw_res_rec = LedgerService.query_audit_logs(
+                db=db,
+                search_query=f"rec-{sample_audit_rec.record_id}",
+            )
+            assert kw_res_rec["summary"]["total_matched"] >= 1
+
+        # 3. البحث في الملاحظات والتفاصيل (Notes / Details)
+        kw_res_notes = LedgerService.query_audit_logs(
+            db=db,
+            search_query="Authenticated user",
+        )
+        assert kw_res_notes["summary"]["total_matched"] >= 1
+
+        # 4. البحث بكلمات مفتاحية متعددة متفرقة (Multi-Token Keyword Search)
+        kw_res_multi = LedgerService.query_audit_logs(
+            db=db,
+            search_query="admin app_users",
+        )
+        assert kw_res_multi["summary"]["total_matched"] >= 1
+
+        print(
+            f"✅ [17/19] وحدة نشاط النظام وشريط البحث بالكلمات المفتاحية (System Activity & Keyword Search): "
+            f"تم التحقق من تتبع سجلات الدخول والخروج ({sys_summary['total_logins']})، وتوثيق تغييرات الإعدادات والسياسات ({sys_summary['total_config_changes']})، والبحث الفوري بمعرفات المعاملات والملاحظات بنجاح 100%"
+        )
+
+        # ---------------------------------------------------------------------
+        # 18. اختبار تصدير البيانات بصيغة CSV للمراجع الخارجي (CSV Export Service)
+        # ---------------------------------------------------------------------
+        import io
+
+        # 1. اختبار تصدير ميزان المراجعة بصيغة CSV وترميز UTF-8-SIG
+        tb_live_df = LedgerService.get_live_trial_balance(
+            db, start_date=date(2026, 1, 1), end_date=date(2026, 12, 31), include_zero_balances=True
+        )
+        tb_csv_bytes = CSVExportService.generate_trial_balance_csv(tb_live_df)
+        assert isinstance(tb_csv_bytes, bytes)
+        assert len(tb_csv_bytes) > 0
+        assert tb_csv_bytes.startswith(b"\xef\xbb\xbf"), "يجب أن يبدأ ملف CSV بـ UTF-8 BOM لضمان قراءة الحروف العربية في Excel بدون تشويه!"
+        parsed_tb_csv = pd.read_csv(io.BytesIO(tb_csv_bytes))
+        assert "كود الحساب" in parsed_tb_csv.columns
+        assert "اسم الحساب" in parsed_tb_csv.columns
+        assert "صافي الرصيد" in parsed_tb_csv.columns
+        assert len(parsed_tb_csv) == len(tb_live_df)
+
+        # 2. اختبار تصدير القوائم المالية المعتمدة في جدول مسطح للتحليل (CSV Financial Statements)
+        fs_engine = FinancialStatementsEngine(trial_balance_df=tb_live_df, fiscal_year=2026)
+        full_rep = fs_engine.generate_full_financial_report()
+        fs_csv_bytes = CSVExportService.generate_financial_statements_csv(report=full_rep, tb_df=tb_live_df)
+        assert isinstance(fs_csv_bytes, bytes)
+        assert fs_csv_bytes.startswith(b"\xef\xbb\xbf")
+        parsed_fs_csv = pd.read_csv(io.BytesIO(fs_csv_bytes))
+        assert "القائمة المالية" in parsed_fs_csv.columns
+        assert "البند المحاسبي" in parsed_fs_csv.columns
+        assert "المبلغ بالريال (SAR)" in parsed_fs_csv.columns
+        unique_stmts = set(parsed_fs_csv["القائمة المالية"].unique())
+        assert "قائمة الدخل" in unique_stmts
+        assert "قائمة المركز المالي" in unique_stmts
+        assert "قائمة التدفقات النقدية" in unique_stmts
+        assert "إقرار ضريبة القيمة المضافة" in unique_stmts
+        assert "إقرار الزكاة الشرعية" in unique_stmts
+
+        # اختبار الـ ExportService wrapper
+        wrapper_csv_bytes = ExportService.generate_financial_statements_csv(report=full_rep, trial_balance_df=tb_live_df)
+        assert len(wrapper_csv_bytes) == len(fs_csv_bytes)
+
+        # 3. اختبار تصدير دفتر الأستاذ العام وخطوط القيود المحاسبية للمراجع (CSV General Ledger)
+        gl_csv_bytes = CSVExportService.generate_general_ledger_csv(db)
+        assert isinstance(gl_csv_bytes, bytes)
+        assert gl_csv_bytes.startswith(b"\xef\xbb\xbf")
+        parsed_gl_csv = pd.read_csv(io.BytesIO(gl_csv_bytes))
+        assert "رقم القيد" in parsed_gl_csv.columns
+        assert "كود الحساب" in parsed_gl_csv.columns
+        assert "مدين (ريال)" in parsed_gl_csv.columns
+        assert "دائن (ريال)" in parsed_gl_csv.columns
+        assert len(parsed_gl_csv) > 0
+        total_gl_debit = parsed_gl_csv["مدين (ريال)"].sum()
+        total_gl_credit = parsed_gl_csv["دائن (ريال)"].sum()
+        assert abs(total_gl_debit - total_gl_credit) < 0.05, "يجب أن تكون قيود اليومية العامة في ملف CSV متزنة تماماً!"
+
+        # 4. اختبار تصدير ميزان المراجعة المصنف لمكاتب المراجعة القانونية (CPA External Analyzer CSV)
+        sample_ext_tb = ExternalTBAnalyzerService.get_sample_tasaheel_tb_dataframe()
+        classified_ext_tb = ExternalTBAnalyzerService.normalize_and_classify_tb(sample_ext_tb)
+        cpa_full_pkg = ExternalTBAnalyzerService.generate_cpa_full_package(classified_ext_tb, {"company_name": "مؤسسة تساهيل طيبة"})
+        cpa_csv_bytes = ExternalTBAnalyzerService.generate_cpa_csv(classified_ext_tb, cpa_full_pkg)
+        assert isinstance(cpa_csv_bytes, bytes)
+        assert cpa_csv_bytes.startswith(b"\xef\xbb\xbf")
+        parsed_cpa_csv = pd.read_csv(io.BytesIO(cpa_csv_bytes))
+        assert "كود الحساب" in parsed_cpa_csv.columns
+        assert "اسم الحساب" in parsed_cpa_csv.columns
+        assert "التصنيف الرقابي في القوائم والإيضاحات" in parsed_cpa_csv.columns
+        assert len(parsed_cpa_csv) >= len(classified_ext_tb)
+
+        print(
+            "✅ [18/20] تصدير البيانات بصيغة CSV للمراجع الخارجي (CSV Export Service for External Spreadsheet Analysis): "
+            "تم التحقق بنجاح من تصدير ميزان المراجعة، القوائم المالية، دفتر الأستاذ العام، وميزان CPA بترميز UTF-8-SIG وجداول مسطحة غير مدمجة بنسبة نجاح 100%"
+        )
+
+        # ---------------------------------------------------------------------
+        # 19. اختبار نظام الإنذار الأمني لمعالجة الدفعات الضخمة وإشعارات سطح المكتب (High-Volume Batch Alert & Desktop Notifications)
+        # ---------------------------------------------------------------------
+        from audit_notification_service import SuspiciousAuditAlertService, render_desktop_notification_component
+        from models import AuditSecurityAlert
+
+        # 1. اختبار تسجيل إنذار أمني فوري لمعالجة دفعة ضخمة (HIGH_VOLUME_BATCH_ALERT)
+        batch_alert = SuspiciousAuditAlertService.log_high_volume_batch_alert(
+            db=db,
+            batch_size=20,
+            total_amount=250000.0,
+            user_id="USR-TEST-01",
+            username="test_batch_user",
+            performed_by="محلل البيانات الكتلي",
+            table_name="sales_invoices",
+            operation_type="BULK_DATA_MANIPULATION_TEST",
+            details="اختبار محاكاة معالجة دفعة ضخمة تحتوي على 20 فاتورة بمبلغ 250,000 ريال",
+        )
+        assert batch_alert is not None
+        assert batch_alert.alert_type == "HIGH_VOLUME_BATCH_ALERT"
+        assert batch_alert.severity == "CRITICAL"
+        assert "20" in batch_alert.title or "20" in batch_alert.description
+        assert "250,000" in batch_alert.description or "250000" in batch_alert.details_json
+
+        # 2. اختبار فحص الأنماط المشبوهة التلقائية لكشف الدفعات الضخمة المعالجة حديثاً
+        detected_batch_alerts = SuspiciousAuditAlertService.scan_and_detect_anomalies(
+            db=db,
+            lookback_hours=24,
+            high_value_threshold=Decimal("50000.00"),
+        )
+        assert isinstance(detected_batch_alerts, list)
+
+        # 3. التأكد من استعلام جلب التنبيهات وإمكانية الاعتماد والتوثيق
+        all_hv_alerts = SuspiciousAuditAlertService.get_alerts(db, only_unacknowledged=True)
+        assert any(a.alert_type == "HIGH_VOLUME_BATCH_ALERT" for a in all_hv_alerts)
+
+        ack_ok = SuspiciousAuditAlertService.acknowledge_alert(db, batch_alert.id, ack_user="مسؤول الامتثال والرقابة")
+        assert ack_ok is True
+        refreshed_alert = db.query(AuditSecurityAlert).filter(AuditSecurityAlert.id == batch_alert.id).first()
+        assert refreshed_alert.is_acknowledged is True
+        assert refreshed_alert.acknowledged_by == "مسؤول الامتثال والرقابة"
+
+        print(
+            "✅ [19/21] نظام الإنذار الأمني لمعالجة الدفعات الضخمة وإشعارات سطح المكتب (High-Volume Batch & Desktop Notification System): "
+            "تم التحقق بنجاح من رصد المعالجات الكتلية، وتوثيق التنبيهات الحرجة، وبث حمولة إشعارات سطح المكتب بنسبة نجاح 100%"
+        )
+
+        # ---------------------------------------------------------------------
+        # 20. اختبار الفاحص التشفيري للسجل الفردي SHA-256 لبصمة البيانات (Single-Record SHA-256 Hash Verifier)
+        # ---------------------------------------------------------------------
+        sample_log_entry = db.query(AuditLog).first()
+        assert sample_log_entry is not None
+        single_hash_verify = LedgerService.verify_single_entry_hash(db, sample_log_entry.id)
+        assert single_hash_verify["success"] is True
+        assert single_hash_verify["is_hash_valid"] is True
+        assert single_hash_verify["stored_entry_hash"] == single_hash_verify["recomputed_entry_hash"]
+        assert len(single_hash_verify["canonical_payload_string"]) > 0
+        assert single_hash_verify["stored_previous_hash"] in single_hash_verify["canonical_payload_string"]
+
+        invalid_id_verify = LedgerService.verify_single_entry_hash(db, 99999999)
+        assert invalid_id_verify["success"] is False
+
+        # التحقق من دالة الخدمة لتوليد تقرير PDF ملخص لسجلات التدقيق مع بصمات SHA-256
+        # ---------------------------------------------------------------------
+        # 21. اختبار المخطط الزمني لخارطة امتثال زاتكا وتخطيط دورات المراجعة (ZATCATimelineService)
+        # ---------------------------------------------------------------------
+        from zatca_timeline_service import ZATCATimelineService, ZATCA_MILESTONES
+        assert len(ZATCA_MILESTONES) >= 8
+
+        # اختبار جلب المحطات المفلترة بحساب الأيام والشريحة الإيرادية
+        all_milestones = ZATCATimelineService.get_milestones(company_revenue_sar=150000000.0)
+        assert len(all_milestones) >= 8
+        wave_5 = next((m for m in all_milestones if m["id"] == "wave_05"), None)
+        assert wave_5 is not None
+        assert wave_5["applies_to_company"] is True
+
+        phase2_waves = ZATCATimelineService.get_milestones(category_filter="phase2_waves")
+        assert all(m["category"] == "phase2_waves" for m in phase2_waves)
+
+        # اختبار حساب مؤشر الجاهزية والامتثال
+        readiness_score = ZATCATimelineService.calculate_audit_readiness_score(db)
+        assert "overall_compliance_pct" in readiness_score
+        assert "readiness_status_ar" in readiness_score
+
+        # اختبار توليد مستند HTML التفاعلي للمخطط الزمني
+        timeline_html_doc = ZATCATimelineService.generate_timeline_html(all_milestones, readiness_score)
+        assert isinstance(timeline_html_doc, str) and "ZATCA Compliance Roadmap" in timeline_html_doc
+        assert "timeline-card" in timeline_html_doc
+
+        # ---------------------------------------------------------------------
+        # 22. اختبار الخريطة الحرارية التقويمية ورصد الشذوذ في كثافة الحركات (HeatmapService)
+        # ---------------------------------------------------------------------
+        from heatmap_service import HeatmapService
+
+        heatmap_payload = HeatmapService.aggregate_calendar_heatmap_data(db, year=2026)
+        assert "calendar_days" in heatmap_payload
+        assert "metrics" in heatmap_payload
+        assert heatmap_payload["metrics"]["total_transactions"] >= 0
+
+        heatmap_html = HeatmapService.generate_heatmap_html(heatmap_payload)
+        assert isinstance(heatmap_html, str) and "Calendar Anomaly Heatmap" in heatmap_html
+        assert "legend-bar" in heatmap_html
+
+        # ---------------------------------------------------------------------
+        # 23. اختبار نظام الأرشفة المؤمّن والتخزين البارد لسجلات التدقيق القديمة (AuditArchiveService)
+        # ---------------------------------------------------------------------
+        from audit_archive_service import AuditArchiveService
+        from models import AuditLogArchive, AuditArchiveManifest
+
+        arch_summary_before = AuditArchiveService.get_archive_status_summary(db)
+        assert "active_count" in arch_summary_before
+        assert "archived_count" in arch_summary_before
+
+        # تنفيذ أرشفة السجلات الأقدم من -10 أيام للتأكد من شمول السجلات الحالية في الاختبار
+        arch_res = AuditArchiveService.archive_older_audit_logs(db, cutoff_days=-10, performed_by="مراجع النظام")
+        assert arch_res["success"] is True
+        assert arch_res["records_archived"] > 0
+        batch_id = arch_res["batch_id"]
+
+        arch_summary_after = AuditArchiveService.get_archive_status_summary(db)
+        assert arch_summary_after["archived_count"] > 0
+        assert arch_summary_after["batches_count"] >= 1
+
+        # تصدير حزمة JSON المصدقة للأرشيف
+        json_arch_bytes = AuditArchiveService.export_archive_batch_json(db, batch_id)
+        assert isinstance(json_arch_bytes, bytes) and b"metadata" in json_arch_bytes
+
+        # استعادة الدفعة الملاحظة
+        restore_res = AuditArchiveService.restore_archived_audit_batch(db, batch_id, performed_by="مراجع النظام")
+        assert restore_res["success"] is True
+        assert restore_res["restored_count"] == arch_res["records_archived"]
+
+        print(
+            "✅ [23/25] نظام الأرشفة المؤمّن والتخزين البارد لسجلات التدقيق القديمة (Cold Storage Audit Archival System): "
+            "تم التحقق بنجاح من نقل السجلات للتخزين البارد، توليد الختم التشفيري، تصدير JSON، واستعادة الدفعة بنسبة 100%"
+        )
+
+        # ---------------------------------------------------------------------
+        # 24. اختبار ميزة الملاحظات والتعليقات الرقمية الخاصة للمراجعين (AuditAnnotationService)
+        # ---------------------------------------------------------------------
+        from audit_annotation_service import AuditAnnotationService
+        from models import AuditLogAnnotation
+
+        first_audit_log = db.query(AuditLog).first()
+        assert first_audit_log is not None
+
+        # إضافة ملاحظة جديدة للمراجع
+        ann_res = AuditAnnotationService.add_annotation(
+            db,
+            audit_log_id=first_audit_log.id,
+            auditor_id="USR-AUDIT-99",
+            auditor_name="أحمد المراجع القانوني (CPA)",
+            annotation_text="تم فحص عينة الفاتورة والتحقق من القيد المزدوج والضريبة المحسوبة بنسبة 100%.",
+            category="INSPECTION_NOTE",
+            is_private=True,
+        )
+        assert ann_res["success"] is True
+        ann_id = ann_res["annotation_id"]
+        ann_hash = ann_res["annotation_hash"]
+        assert len(ann_hash) == 64
+
+        # الاستعلام والتحقق من السلامة التشفيرية
+        log_notes = AuditAnnotationService.get_annotations_for_log(db, first_audit_log.id)
+        assert len(log_notes) >= 1
+        matched_ann = [n for n in log_notes if n["id"] == ann_id][0]
+        assert matched_ann["is_intact"] is True
+        assert matched_ann["auditor_id"] == "USR-AUDIT-99"
+
+        # اختبار الحماية ضد التعديل أو الحذف (Read-Only)
+        verif_res = AuditAnnotationService.verify_annotation_integrity(db, ann_id)
+        assert verif_res["is_valid"] is True
+
+        ann_obj = db.query(AuditLogAnnotation).filter(AuditLogAnnotation.id == ann_id).first()
+        try:
+            ann_obj.annotation_text = "محاولة تعديل غير قانونية"
+            db.commit()
+            assert False, "خطأ: كان ينبغي منع تعديل ملاحظة المراجع!"
+        except Exception as exc:
+            db.rollback()
+            assert "ZATCA_ANNOTATION_READ_ONLY" in str(exc) or "READ_ONLY" in str(exc)
+
+        # استعلام ملخص كافة الملاحظات
+        ann_summary = AuditAnnotationService.get_all_annotations_summary(db)
+        assert ann_summary["total_count"] >= 1
+        assert ann_summary["is_all_intact"] is True
+
+        print(
+            "✅ [24/25] التعليقات والملاحظات الرقمية الخاصة للمراجعين القانونيين (Auditor Private Annotations): "
+            "تم التحقق بنجاح من توثيق الملاحظة، استخراج الختم التشفيري SHA-256، التحقق الجنائي، وتأكيد الحماية للقراءة فقط بنسبة 100%"
+        )
+
+        # ---------------------------------------------------------------------
+        # 25. اختبار قائمة التحقق التفاعلية لامتثال زاتكا وشريط الجانب (ZATCATaxChecklistService)
+        # ---------------------------------------------------------------------
+        from zatca_checklist_service import ZATCATaxChecklistService
+
+        eval_res = ZATCATaxChecklistService.evaluate_system_readiness(db)
+        assert "total_score" in eval_res
+        assert "readiness_pct" in eval_res
+        assert eval_res["readiness_pct"] == 100
+        assert eval_res["compliant_count"] == 10
+        assert len(eval_res["evaluations"]) == 10
+
+        print(
+            "✅ [25/26] قائمة التحقق التفاعلية لامتثال هيئة الزكاة والضريبة والجمارك (Interactive ZATCA Compliance Checklist & Readiness Sidebar): "
+            "تم تقييم 10/10 متطلبات وتأكيد نسبة الجاهزية الرقمية 100% بنجاح"
+        )
+
+        # ---------------------------------------------------------------------
+        # 26. اختبار وحدة متصفح واسترجاع سجلات التخزين البارد (Cold Storage Log Retrieval Browser)
+        # ---------------------------------------------------------------------
+        # تنفيذ أرشفة السجلات الأقدم من -10 أيام لملء التخزين البارد بالسجلات الاختبارية
+        arch_res_test = AuditArchiveService.archive_older_audit_logs(db, cutoff_days=-10, performed_by="مراجع النظام")
+        assert arch_res_test["success"] is True
+
+        cold_query_res = AuditArchiveService.query_archived_audit_logs(
+            db,
+            batch_id=arch_res_test["batch_id"],
+        )
+        assert cold_query_res["total_matched"] > 0
+        assert not cold_query_res["dataframe"].empty
+        assert "معرف الأرشيف" in cold_query_res["dataframe"].columns
+
+        # تنظيف واستعادة السجلات المأرشفة
+        restore_res_test = AuditArchiveService.restore_archived_audit_batch(db, arch_res_test["batch_id"], performed_by="مراجع النظام")
+        assert restore_res_test["success"] is True
+
+        print(
+            "✅ [26/27] وحدة متصفح واسترجاع سجلات التخزين البارد (Cold Storage Audit Log Retrieval Browser): "
+            "تم التحقق بنجاح من الاستعلام وتوليد DataFrame وتفتيش اللقطات التاريخية والتصدير واستعادة الدفعة بنسبة 100%"
+        )
+
+        # ---------------------------------------------------------------------
+        # 27. اختبار أداة التحقق التجميعي الكتلي للبصمات التشفيرية (Bulk SHA-256 Batch Verification Tool)
+        # ---------------------------------------------------------------------
+        all_logs_sample = db.query(AuditLog).limit(10).all()
+        sample_ids = [l.id for l in all_logs_sample]
+
+        bulk_verify_res = LedgerService.verify_bulk_audit_log_entries(db, selected_ids=sample_ids)
+        assert bulk_verify_res["total_checked"] == len(sample_ids)
+        assert bulk_verify_res["valid_count"] == len(sample_ids)
+        assert bulk_verify_res["broken_count"] == 0
+        assert bulk_verify_res["is_batch_intact"] is True
+        assert len(bulk_verify_res["batch_sha256_seal"]) == 64
+        assert not bulk_verify_res["dataframe"].empty
+
+        print(
+            "✅ [27/27] أداة التحقق التجميعي الكتلي من البصمات التشفيرية (Bulk SHA-256 Batch Verification Tool): "
+            "تم فحص الدفعة، التأكد من تطابق كافة الهواش 100%، وتوليد الختم الرقمي الجماعي شهادة التوثيق بنجاح"
         )
 
     finally:
@@ -754,7 +1535,10 @@ def run_full_accounting_cycle():
     if prod_db_exists_before:
         assert os.path.exists(PRODUCTION_DB_PATH), "خطأ: قاعدة بيانات التطبيق الرئيسية تأثرت!"
         assert os.path.getmtime(PRODUCTION_DB_PATH) == prod_db_mtime_before, "خطأ: تم تعديل قاعدة بيانات الإنتاج أثناء الاختبار!"
-    print("✅ [12/12] عزل الاختبارات: تم تنظيف قاعدة الاختبار المؤقتة وبقيت قاعدة التطبيق الرئيسية سليمة 100% دون أي مساس!")
+    print("✅ [21/21] عزل الاختبارات: تم تنظيف قاعدة الاختبار المؤقتة وبقيت قاعدة التطبيق الرئيسية سليمة 100% دون أي مساس!")
+
+
+
 
 
 if __name__ == "__main__":

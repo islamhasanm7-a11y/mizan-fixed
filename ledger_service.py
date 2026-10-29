@@ -233,9 +233,32 @@ class LedgerService:
             v_clean = str(kwargs["vat_number"]).strip()
             if not (len(v_clean) == 15 and v_clean.isdigit() and v_clean.startswith("3") and v_clean.endswith("3")):
                 raise LedgerValidationError("الرقم الضريبي للمنشأة في المملكة العربية السعودية يجب أن يتكون من 15 رقماً ويبدأ وينتهي بالرقم 3.")
+        old_cfg = {
+            "company_name_ar": settings.company_name_ar,
+            "vat_number": settings.vat_number,
+            "default_vat_rate": str(settings.default_vat_rate),
+            "fiscal_year": settings.fiscal_year,
+        }
         for k, v in kwargs.items():
             if hasattr(settings, k) and v is not None:
                 setattr(settings, k, v)
+        new_cfg = {
+            "company_name_ar": settings.company_name_ar,
+            "vat_number": settings.vat_number,
+            "default_vat_rate": str(settings.default_vat_rate),
+            "fiscal_year": settings.fiscal_year,
+        }
+        from system_activity_service import SystemActivityService
+        SystemActivityService.log_configuration_change(
+            db=db,
+            config_category="COMPANY_SETTINGS",
+            target_item="إعدادات المنشأة وبيانات الضريبة والسنة المالية",
+            action_type="UPDATE_SETTINGS",
+            old_values=old_cfg,
+            new_values=new_cfg,
+            performed_by=performed_by,
+            change_reason="تحديث إعدادات المنشأة والضريبة والسنة المالية",
+        )
         db.add(AuditLog(
             table_name="company_settings",
             record_id=settings.id or 1,
@@ -246,6 +269,7 @@ class LedgerService:
         db.commit()
         db.refresh(settings)
         return settings
+
 
     # =========================================================================
     # 2.ب إدارة المستخدمين والتخصيص الحر للصلاحيات (Custom RBAC & User Management)
@@ -375,6 +399,145 @@ class LedgerService:
                 if is_intact else
                 "تنبيه أمني: تم رصد خلل في سلسلة التدقيق أو تريجرات الحماية ❌"
             ),
+        }
+
+    @classmethod
+    def verify_single_entry_hash(cls, db: Session, log_id: int) -> Dict[str, Any]:
+        """
+        التحقق التشفيري المباشر لحساب وتأكيد بصمة SHA-256 لسجل تدقيق فردي
+        وتوليد شهادة التحقق الجنائي لمراجعي الحسابات الخارجيين
+        """
+        from models import AUDIT_GENESIS_HASH, AuditLog, compute_audit_entry_hash, quantize_money
+        lg = db.query(AuditLog).filter(AuditLog.id == log_id).first()
+        if not lg:
+            return {"success": False, "error": f"سجل التدقيق رقم {log_id} غير موجود بالقاعدة."}
+
+        prev_h = lg.previous_hash or AUDIT_GENESIS_HASH
+        recomputed_hash = compute_audit_entry_hash(
+            previous_hash=prev_h,
+            timestamp=lg.timestamp,
+            user_id=lg.user_id,
+            username=lg.username,
+            performed_by=lg.performed_by,
+            table_name=lg.table_name,
+            record_id=lg.record_id,
+            action=lg.action,
+            reference_number=lg.reference_number,
+            financial_amount=lg.financial_amount,
+            details=lg.details,
+        )
+
+        is_valid = bool(lg.entry_hash and lg.entry_hash == recomputed_hash)
+
+        ts_str = lg.timestamp.strftime("%Y-%m-%dT%H:%M:%S") if hasattr(lg.timestamp, "strftime") else str(lg.timestamp)[:19]
+        canonical_raw = (
+            f"{prev_h}|{ts_str}|{lg.user_id or 'USR-001'}|{lg.username or 'admin'}|{lg.performed_by or ''}|"
+            f"{lg.table_name or ''}|{lg.record_id or 0}|{lg.action or ''}|{lg.reference_number or ''}|"
+            f"{quantize_money(lg.financial_amount):.2f}|{lg.details or ''}"
+        )
+
+        return {
+            "success": True,
+            "log_id": lg.id,
+            "action": lg.action,
+            "table_name": lg.table_name,
+            "user_id": lg.user_id,
+            "username": lg.username,
+            "performed_by": lg.performed_by,
+            "timestamp_utc": ts_str,
+            "stored_previous_hash": prev_h,
+            "stored_entry_hash": lg.entry_hash,
+            "recomputed_entry_hash": recomputed_hash,
+            "canonical_payload_string": canonical_raw,
+            "is_hash_valid": is_valid,
+            "status_text": "بصمة SHA-256 مطابقة وسليمة 100% ✅ (لم يتعرض السجل لأي تعديل)" if is_valid else "⚠️ تنبيه: عدم تطابق في بصمة SHA-256! احتمال تلاعب بالسجل."
+        }
+
+    @classmethod
+    def verify_bulk_audit_log_entries(cls, db: Session, selected_ids: Optional[List[int]] = None) -> Dict[str, Any]:
+        """
+        أداة التحقق التجميعي الكتلي من البصمات التشفيرية SHA-256 لمجموعة محددة من سجلات التدقيق
+        (Bulk SHA-256 Batch Verification Tool for Selected Audit Log Entries)
+        """
+        query = db.query(AuditLog)
+        if selected_ids and len(selected_ids) > 0:
+            query = query.filter(AuditLog.id.in_(selected_ids))
+
+        logs = query.order_by(AuditLog.id.asc()).all()
+
+        results = []
+        valid_count = 0
+        broken_count = 0
+
+        for lg in logs:
+            computed_hash = compute_audit_entry_hash(
+                previous_hash=lg.previous_hash,
+                timestamp=lg.timestamp,
+                user_id=lg.user_id,
+                username=lg.username,
+                performed_by=lg.performed_by,
+                table_name=lg.table_name,
+                record_id=lg.record_id,
+                action=lg.action,
+                reference_number=lg.reference_number,
+                financial_amount=lg.financial_amount,
+                details=lg.details,
+            )
+            is_valid = bool(lg.entry_hash and lg.entry_hash == computed_hash)
+            if is_valid:
+                valid_count += 1
+            else:
+                broken_count += 1
+
+            results.append({
+                "id": lg.id,
+                "table_name": lg.table_name,
+                "record_id": lg.record_id,
+                "action": lg.action,
+                "user_id": lg.user_id,
+                "username": lg.username,
+                "performed_by": lg.performed_by,
+                "timestamp": lg.timestamp.strftime("%Y-%m-%d %H:%M:%S") if lg.timestamp else "—",
+                "reference_number": lg.reference_number or "—",
+                "financial_amount": float(lg.financial_amount or 0.0),
+                "stored_hash": lg.entry_hash,
+                "computed_hash": computed_hash,
+                "is_valid": is_valid,
+                "status_badge_ar": "✅ الختم مطبق وسليم" if is_valid else "❌ تنبيه: خرق تشفيري",
+            })
+
+        total_checked = len(results)
+        is_batch_intact = (total_checked > 0 and broken_count == 0)
+
+        # توليد ختم المتابعة التجميعي للدفعة المفحوصة
+        batch_raw = f"{total_checked}|{valid_count}|{broken_count}|" + "|".join(str(r["id"]) + ":" + str(r["stored_hash"]) for r in results)
+        batch_sha256 = hashlib.sha256(batch_raw.encode("utf-8")).hexdigest() if results else AUDIT_GENESIS_HASH
+
+        rows = [
+            {
+                "معرف السجل": r["id"],
+                "الجدول المالي": r["table_name"],
+                "الإجراء": r["action"],
+                "المستخدم": f"{r['user_id']} ({r['username']})",
+                "المستند / المرجع": r["reference_number"],
+                "المبلغ المالي (ريال)": r["financial_amount"],
+                "البصمة المخزنة": f"{r['stored_hash'][:16]}..." if r["stored_hash"] else "—",
+                "البصمة المحسوبة": f"{r['computed_hash'][:16]}...",
+                "حالة الختم التشفيري": r["status_badge_ar"],
+            }
+            for r in results
+        ]
+        df = pd.DataFrame(rows) if rows else pd.DataFrame()
+
+        return {
+            "total_checked": total_checked,
+            "valid_count": valid_count,
+            "broken_count": broken_count,
+            "is_batch_intact": is_batch_intact,
+            "batch_sha256_seal": batch_sha256,
+            "results": results,
+            "dataframe": df,
+            "verification_status_ar": "دفعة سليمة 100% ومطابقة أمنياً ✅" if is_batch_intact else "تنبيه: يوجد خرق أمني بالدفعة ❌",
         }
 
     @classmethod
@@ -623,16 +786,20 @@ class LedgerService:
             if only_modifications and not is_mod:
                 continue
 
-            # 8. البحث النصي الشامل (Search Query)
+            # 8. البحث بالكلمات المفتاحية في السجلات الرقابية (Keyword Search: Transaction IDs, Notes, Ref, Diff)
             if q_norm:
+                tx_id_tokens = f"#{lg.id} rec-{lg.record_id} tx-{lg.record_id} {lg.record_id or ''}"
                 haystack = (
-                    f"{lg.id} {lg.user_id or ''} {lg.username or ''} {lg.performed_by or ''} "
+                    f"{lg.id} {tx_id_tokens} {lg.user_id or ''} {lg.username or ''} {lg.performed_by or ''} "
                     f"{lg.table_name or ''} {lg.action or ''} {lg.reference_number or ''} "
                     f"{lg.details or ''} {lg.entry_hash or ''} {lg.previous_hash or ''} "
                     f"{lg.old_values_json or ''} {lg.new_values_json or ''}"
                 ).lower()
-                if q_norm not in haystack:
+
+                search_tokens = q_norm.split()
+                if not all(token in haystack for token in search_tokens):
                     continue
+
 
             matched_logs.append(lg)
             if limit and len(matched_logs) >= int(limit):
@@ -826,6 +993,43 @@ class LedgerService:
         )
 
     @classmethod
+    def generate_audit_log_pdf_summary(
+        cls,
+        db: Session,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None,
+        user_filter: Optional[str] = None,
+        transaction_type: Optional[str] = None,
+        table_name: Optional[str] = None,
+        action: Optional[str] = None,
+        search_query: Optional[str] = None,
+        min_amount: Optional[float] = None,
+        only_modifications: bool = False,
+        requesting_user: Optional[Any] = None,
+        auditor_notes: Optional[str] = None,
+        limit: int = 1000,
+    ) -> bytes:
+        """
+        توليد تقرير ملخص بصيغة PDF مؤمّنة وغير قابلة للتعديل لسجلات التدقيق الرقابي،
+        مشتملة على بصمة التشفير (SHA-256 Integrity Hash) لكل سجل وفق متطلبات الامتثال لهيئة الزكاة والضريبة والجمارك (ZATCA).
+        """
+        return cls.export_immutable_audit_pdf(
+            db=db,
+            start_date=start_date,
+            end_date=end_date,
+            user_filter=user_filter,
+            transaction_type=transaction_type,
+            table_name=table_name,
+            action=action,
+            search_query=search_query,
+            min_amount=min_amount,
+            only_modifications=only_modifications,
+            requesting_user=requesting_user,
+            auditor_notes=auditor_notes,
+            limit=limit,
+        )
+
+    @classmethod
     def verify_immutable_audit_pdf(cls, pdf_bytes: bytes) -> Dict[str, Any]:
         """التحقق الجنائي من سلامة وعدم التلاعب بملف PDF المصدّر لسجل التدقيق الرقابي للمراجع الخارجي"""
         from zatca_audit_pdf import ZATCAAuditPDFExporter
@@ -858,10 +1062,40 @@ class LedgerService:
             raise LedgerValidationError("يرجى إدخال اسم المستخدم ورمز الدخول السري (PIN).")
 
         user = db.query(AppUser).filter(func.lower(AppUser.username) == uname).first()
-        if not user or not user.is_active:
+        from system_activity_service import SystemActivityService
+
+        if not user:
+            SystemActivityService.log_login_attempt(
+                db=db,
+                username=uname,
+                status="FAILED_USER_NOT_FOUND",
+                failure_reason="اسم المستخدم غير مسجل بالنظام",
+                details=f"Login attempt with non-existent username: {uname}",
+            )
+            raise LedgerValidationError("اسم المستخدم أو رمز الدخول السري غير صحيح، أو أن الحساب موقوف.")
+
+        if not user.is_active:
+            SystemActivityService.log_login_attempt(
+                db=db,
+                username=user.username,
+                status="FAILED_USER_LOCKED",
+                user_id=user.id,
+                full_name_ar=user.full_name_ar,
+                failure_reason="الحساب موقوف أو مقفل أمنياً",
+                details=f"Login attempt on inactive account: {user.username}",
+            )
             raise LedgerValidationError("اسم المستخدم أو رمز الدخول السري غير صحيح، أو أن الحساب موقوف.")
 
         if not user.verify_pin(raw_pin):
+            SystemActivityService.log_login_attempt(
+                db=db,
+                username=user.username,
+                status="FAILED_BAD_PIN",
+                user_id=user.id,
+                full_name_ar=user.full_name_ar,
+                failure_reason="رمز الدخول السري (PIN) المدخل غير صحيح",
+                details=f"Failed PIN authentication attempt for username: {uname}",
+            )
             db.add(AuditLog(
                 table_name="app_users",
                 record_id=user.id,
@@ -872,6 +1106,14 @@ class LedgerService:
             db.commit()
             raise LedgerValidationError("اسم المستخدم أو رمز الدخول السري غير صحيح.")
 
+        SystemActivityService.log_login_attempt(
+            db=db,
+            username=user.username,
+            status="SUCCESS",
+            user_id=user.id,
+            full_name_ar=user.full_name_ar,
+            details=f"Authenticated user: {user.username} (must_change_pin={bool(user.must_change_pin)})",
+        )
         db.add(AuditLog(
             table_name="app_users",
             record_id=user.id,
@@ -882,6 +1124,7 @@ class LedgerService:
         db.commit()
         db.refresh(user)
         return user
+
 
     @classmethod
     def change_user_pin(
@@ -919,6 +1162,28 @@ class LedgerService:
         if user.username.lower() == "admin":
             clear_initial_admin_bootstrap_pin()
 
+        from system_activity_service import SystemActivityService
+        SystemActivityService.log_login_attempt(
+            db=db,
+            username=user.username,
+            status="PIN_CHANGE",
+            user_id=user.id,
+            full_name_ar=user.full_name_ar,
+            details=f"User {user.username} successfully updated secret PIN",
+        )
+        SystemActivityService.log_configuration_change(
+            db=db,
+            config_category="SECURITY_POLICY",
+            target_item=f"رمز الدخول السري (PIN) - {user.full_name_ar} ({user.username})",
+            action_type="PIN_CHANGE",
+            old_values={"pin_status": "PREVIOUS_PIN_SET", "must_change_pin": True},
+            new_values={"pin_status": "NEW_PIN_HASHED_SECURELY", "must_change_pin": False},
+            performed_by=performed_by or user.full_name_ar,
+            user_id=f"USR-{user.id:03d}",
+            username=user.username,
+            change_reason="تغيير رمز الدخول السري للمستخدم",
+        )
+
         db.add(AuditLog(
             table_name="app_users",
             record_id=user.id,
@@ -929,6 +1194,7 @@ class LedgerService:
         db.commit()
         db.refresh(user)
         return user
+
 
     @classmethod
     def create_or_update_user(
@@ -1004,6 +1270,20 @@ class LedgerService:
             db_sess.flush()
 
         enabled_count = sum(1 for v in base_perms.values() if v)
+        from system_activity_service import SystemActivityService
+        SystemActivityService.log_configuration_change(
+            db=db_sess,
+            config_category="USER_PERMISSIONS",
+            target_item=f"حساب وصلاحيات المستخدم: {user.full_name_ar} ({user.username})",
+            action_type="CREATE_USER" if is_new else "UPDATE_PERMISSIONS",
+            old_values=None if is_new else {"role": user.role.value, "is_active": user.is_active},
+            new_values={"role": role.value, "is_active": bool(is_active), "enabled_perms_count": enabled_count, "max_discount_pct": float(max_discount_pct)},
+            performed_by=performed_by,
+            user_id=f"USR-{user.id:03d}",
+            username=user.username,
+            change_reason="إنشاء مستخدم جديد أو تعديل مصفوفة الصلاحيات الحرة وسقف الخصم",
+        )
+
         db_sess.add(AuditLog(
             table_name="app_users",
             record_id=user.id,
@@ -1014,6 +1294,7 @@ class LedgerService:
         db_sess.commit()
         db_sess.refresh(user)
         return user
+
 
     @classmethod
     def save_custom_role_template(
@@ -1043,6 +1324,17 @@ class LedgerService:
             db.add(tpl)
             db.flush()
 
+        from system_activity_service import SystemActivityService
+        SystemActivityService.log_configuration_change(
+            db=db,
+            config_category="CUSTOM_ROLES",
+            target_item=f"قالب الصلاحيات المخصص: {t_name}",
+            action_type="SAVE_ROLE_TEMPLATE",
+            new_values={"template_name": t_name, "description": description, "enabled_perms": sum(1 for v in clean_perms.values() if v)},
+            performed_by=performed_by,
+            change_reason="حفظ أو تعديل قالب صلاحيات وظيفي مخصص",
+        )
+
         db.add(AuditLog(
             table_name="custom_role_templates",
             record_id=tpl.id,
@@ -1053,6 +1345,7 @@ class LedgerService:
         db.commit()
         db.refresh(tpl)
         return tpl
+
 
     @classmethod
     def delete_custom_role_template(
