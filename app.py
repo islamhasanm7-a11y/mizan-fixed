@@ -180,6 +180,7 @@ from models import (
     CustomRoleTemplate, Warehouse, WarehouseStock, SYSTEM_MODULES, MODULE_LABEL_TO_KEY, SYSTEM_ACTIONS,
     ALL_PERMISSION_KEYS, get_default_permissions_for_role, verify_pin_code
 )
+import base64
 import sqlite3
 import shutil
 import tempfile
@@ -189,6 +190,7 @@ from ledger_service import LedgerService, LedgerValidationError
 from financial_engine import FinancialStatementsEngine
 from export_service import ExcelExportService, PrintTemplateService
 from tb_analyzer_service import ExternalTBAnalyzerService, CPA_CATEGORIES, AUDIT_OPINION_TYPES
+from google_drive_service import GoogleDriveService, SCOPES as GOOGLE_DRIVE_SCOPES
 
 
 # =============================================================================
@@ -373,6 +375,7 @@ with st.sidebar:
     )
 
     st.divider()
+    show_global_gdrive = st.checkbox("☁️ فتح مركز Google Drive السحابي في أعلى الشاشة", value=False, key="chk_global_gdrive")
     if curr_u["permissions"].get("act_export_reports", False):
         db_file_path = os.path.join(BASE_DIR, "mizanpro_ledger.db")
         if os.path.exists(db_file_path):
@@ -397,6 +400,61 @@ def has_perm(perm_key: str) -> bool:
 
 def get_active_user_label() -> str:
     return st.session_state.get("active_user", "مدير النظام (Admin)")
+
+
+def render_google_drive_hub_section(
+    db,
+    cpa_word_bytes: bytes = b"",
+    cpa_word_filename: str = "CPA_Audited_Financial_Statements_2026.doc",
+    height: int = 540
+) -> None:
+    """تجهيز الحزم المالية المشفرة (Base64) وعرض واجهة التكامل السحابي مع Google Drive"""
+    try:
+        cfg_gd = LedgerService.get_company_settings(db)
+        excel_io = ExcelExportService.generate_master_excel_report(db, fiscal_year=cfg_gd.fiscal_year)
+        excel_b64 = base64.b64encode(excel_io.getvalue()).decode("utf-8")
+        excel_fname = f"MizanPro_Master_Financial_Report_{cfg_gd.fiscal_year}_15_Sheets.xlsx"
+    except Exception:
+        excel_b64 = ""
+        excel_fname = "MizanPro_Executive_Report_2026.xlsx"
+
+    if not cpa_word_bytes:
+        try:
+            sample_tb_gd = ExternalTBAnalyzerService.get_sample_tasaheel_tb_dataframe()
+            c_df_gd = ExternalTBAnalyzerService.normalize_and_classify_tb(sample_tb_gd)
+            pkg_gd = ExternalTBAnalyzerService.generate_cpa_full_package(c_df_gd, {"company_name": cfg_gd.company_name_ar})
+            cpa_word_bytes = ExternalTBAnalyzerService.generate_cpa_word_doc(pkg_gd)
+        except Exception:
+            cpa_word_bytes = b""
+
+    word_b64 = base64.b64encode(cpa_word_bytes).decode("utf-8") if cpa_word_bytes else ""
+
+    db_b64 = ""
+    db_file_p = os.path.join(BASE_DIR, "mizanpro_ledger.db")
+    if os.path.exists(db_file_p):
+        try:
+            with open(db_file_p, "rb") as f_db_gd:
+                db_b64 = base64.b64encode(f_db_gd.read()).decode("utf-8")
+        except Exception:
+            db_b64 = ""
+
+    gdrive_html = GoogleDriveService.render_google_drive_workspace_html(
+        excel_report_b64=excel_b64,
+        excel_filename=excel_fname,
+        cpa_word_b64=word_b64,
+        cpa_word_filename=cpa_word_filename,
+        db_backup_b64=db_b64,
+        db_backup_filename=f"MizanPro_Backup_{date.today()}.db"
+    )
+    components.html(gdrive_html, height=height, scrolling=True)
+
+
+if show_global_gdrive and menu_option != "📊 لوحة التحكم والمؤشرات":
+    _db_gd = get_db_session()
+    try:
+        render_google_drive_hub_section(_db_gd, height=520)
+    finally:
+        _db_gd.close()
 
 
 # =============================================================================
@@ -531,6 +589,10 @@ if menu_option == "📊 لوحة التحكم والمؤشرات":
                 st.markdown('<div class="balanced-badge">✅ الميزانية العمومية وميزان المراجعة متزنان 100%</div>', unsafe_allow_html=True)
             else:
                 st.error(f"❌ يوجد فرق في اتزان الميزانية قدره: {bs['balance_difference']:,.2f}")
+
+        st.divider()
+        st.markdown("#### **☁️ التكامل السحابي المباشر مع Google Drive (حفظ ومزامنة التقارير والنسخ الاحتياطية):**")
+        render_google_drive_hub_section(db, height=540)
     finally:
         db.close()
 
@@ -762,6 +824,14 @@ elif menu_option == "📑 محلل ميزان المراجعة الخارجي و
                 file_name=f"CPA_Financial_Statements_{ext_comp_name}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
+            )
+
+        with st.expander("☁️ **حفظ ومزامنة تقرير المراجع القانوني والقوائم المالية مباشرة في Google Drive**", expanded=False):
+            render_google_drive_hub_section(
+                db,
+                cpa_word_bytes=cpa_word_bytes,
+                cpa_word_filename=f"CPA_Audited_Financial_Statements_{ext_comp_name}.doc",
+                height=520
             )
 
         st.divider()
@@ -1070,11 +1140,12 @@ elif menu_option == "🏗️ الأصول الثابتة، الرواتب، وم
 # 6. الشاشة 4: الرقابة المالية: أعمار الديون، التسوية البنكية، وإقفال السنة
 # =============================================================================
 elif menu_option == "🛡️ الرقابة المالية: أعمار الديون، البنوك، وإقفال السنة":
-    st.markdown("### **منظومة الرقابة المالية: أعمار الديون، مذكرة التسوية البنكية، وإقفال السنة المالية**")
-    t_aging, t_bank, t_close = st.tabs([
+    st.markdown("### **منظومة الرقابة المالية: أعمار الديون، مذكرة التسوية البنكية، إقفال السنة، ومزامنة Google Drive**")
+    t_aging, t_bank, t_close, t_gdrive = st.tabs([
         "📊 أعمار ديون العملاء والموردين (Aging & ECL)",
         "🏦 مذكرة التسوية البنكية الآلية",
-        "🔒 إقفال السنة المالية وإدارة قاعدة البيانات"
+        "🔒 إقفال السنة المالية وإدارة قاعدة البيانات",
+        "☁️ الأرشيف السحابي (Google Drive)"
     ])
 
     db = get_db_session()
@@ -1209,6 +1280,9 @@ elif menu_option == "🛡️ الرقابة المالية: أعمار الدي�
                                 if os.path.exists(tmp_path):
                                     os.remove(tmp_path)
                                 st.error(f"❌ تعذر استعادة النسخة الاحتياطية: {ex_db}")
+
+        with t_gdrive:
+            render_google_drive_hub_section(db, height=560)
     finally:
         db.close()
 

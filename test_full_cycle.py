@@ -167,6 +167,16 @@ def run_full_accounting_cycle():
         assert len(excel_bytes.getvalue()) > 8000
         print("✅ تم توليد مصنف الإكسيل التنفيذي الشامل (15 صفحة) بنجاح تام!")
 
+        # 7. اختبار خدمة التكامل السحابي مع Google Drive (OAuth 2.0 + Firebase Auth)
+        from google_drive_service import GoogleDriveService, SCOPES
+        fb_cfg = GoogleDriveService.load_firebase_config()
+        assert fb_cfg.get("projectId") == "symmetric-physics-pl37k"
+        assert len(SCOPES) == 13
+        gdrive_html = GoogleDriveService.render_google_drive_workspace_html()
+        assert "gsi-material-button" in gdrive_html
+        assert "confirmModalBackdrop" in gdrive_html
+        print(f"✅ خدمة التكامل السحابي مع Google Drive: المشروع ({fb_cfg.get('projectId')}) | النطاقات المفعلة={len(SCOPES)} نطاق")
+
     finally:
         db.close()
         # إعادة قاعدة البيانات لحالتها القياسية الافتراضية النظيفة للتطبيق
