@@ -5,18 +5,29 @@ MizanPro - Enterprise Accounting, Inventory, Treasury, Fixed Assets, Payroll, Au
 """
 
 from datetime import datetime, date, timezone
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 import enum
 import hashlib
 import hmac
 import json
 import secrets
-from typing import Dict, Any, List, Optional
+import re
+from typing import Dict, Any, List, Optional, Tuple
 from sqlalchemy import (
-    Column, Integer, String, Float, Boolean, Date, DateTime,
-    ForeignKey, Enum as SQLEnum, Text
+    Column, Integer, String, Numeric, Boolean, Date, DateTime,
+    ForeignKey, Enum as SQLEnum, Text, TypeDecorator, event, inspect as sa_inspect, text
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, Session
 from database import Base
+
+
+class AuditLogReadOnlyError(PermissionError):
+    """خطأ أمني ورقابي يُرفع عند محاولة تعديل أو حذف أي سجل من سجل التدقيق الإلزامي للقراءة فقط (ZATCA Read-Only Audit Log)"""
+    pass
+
+
+AUDIT_GENESIS_HASH = "0" * 64
+
 
 
 def utc_now() -> datetime:
@@ -25,10 +36,143 @@ def utc_now() -> datetime:
 
 
 # =============================================================================
-# 0. دوال التشفير والتجزئة الآمنة لرموز الدخول (PIN Hashing - PBKDF2-HMAC-SHA256)
+# 0.أ محرك الدقة العشرية وقواعد التقريب المحاسبي والضريبي (ZATCA Decimal Engine)
+# =============================================================================
+
+MONEY_QUANTIZER = Decimal("0.01")
+RATE_QUANTIZER = Decimal("0.0001")
+ROUNDING_MODE = ROUND_HALF_UP
+
+
+def to_decimal(val: Any, default: str = "0.00") -> Decimal:
+    """تحويل آمن لأي قيمة رقمية أو نصية إلى Decimal دون أخطاء الفاصلة العائمة الثنائية"""
+    if val is None or val == "":
+        return Decimal(default)
+    if isinstance(val, Decimal):
+        return val
+    if isinstance(val, (int,)):
+        return Decimal(val)
+    if isinstance(val, float):
+        return Decimal(f"{val:.6f}")
+    try:
+        return Decimal(str(val).strip().replace(",", ""))
+    except (InvalidOperation, ValueError):
+        return Decimal(default)
+
+
+def quantize_money(val: Any) -> Decimal:
+    """تقريب المبالغ المالية إلى هللتين (0.01) وفق قاعدة التقريب التجاري والضريبي (ROUND_HALF_UP)"""
+    return to_decimal(val).quantize(MONEY_QUANTIZER, rounding=ROUNDING_MODE)
+
+
+def round_money(val: Any) -> float:
+    """إرجاع المبلغ المالي مقرباً بدقة Decimal (ROUND_HALF_UP) كقيمة رقمية متوافقة مع الجداول والرسوم"""
+    return float(quantize_money(val))
+
+
+def quantize_rate(val: Any) -> Decimal:
+    """تقريب النسب والكميات وتكاليف الوحدة إلى 4 منازل عشرية (0.0001)"""
+    return to_decimal(val).quantize(RATE_QUANTIZER, rounding=ROUNDING_MODE)
+
+
+def round_rate(val: Any) -> float:
+    return float(quantize_rate(val))
+
+
+def calculate_line_and_tax_amounts(
+    quantity: Any,
+    unit_price: Any,
+    discount: Any = "0.00",
+    tax_rate: Any = "0.15"
+) -> Dict[str, Decimal]:
+    """
+    القاعدة الرسمية لاحتساب وتقريب سطور الفواتير والإشعارات الضريبية (ZATCA E-Invoicing Rounding Rules):
+    1. إجمالي السطر قبل الخصم = تقريب(الكمية × سعر الوحدة، 0.01، ROUND_HALF_UP)
+    2. الصافي الخاضع للضريبة = تقريب(إجمالي السطر - الخصم، 0.01، ROUND_HALF_UP)
+    3. ضريبة القيمة المضافة للسطر = تقريب(الصافي الخاضع للضريبة × نسبة الضريبة، 0.01، ROUND_HALF_UP)
+    4. إجمالي السطر شامل الضريبة = الصافي الخاضع للضريبة + ضريبة السطر
+    """
+    qty_d = quantize_rate(quantity)
+    price_d = quantize_rate(unit_price)
+    disc_d = quantize_money(discount)
+    rate_d = quantize_rate(tax_rate)
+
+    gross_d = quantize_money(qty_d * price_d)
+    if disc_d > gross_d:
+        disc_d = gross_d
+    taxable_d = quantize_money(gross_d - disc_d)
+    vat_d = quantize_money(taxable_d * rate_d)
+    total_d = quantize_money(taxable_d + vat_d)
+
+    return {
+        "quantity": qty_d,
+        "unit_price": price_d,
+        "discount": disc_d,
+        "tax_rate": rate_d,
+        "gross_amount": gross_d,
+        "taxable_amount": taxable_d,
+        "tax_amount": vat_d,
+        "total_with_tax": total_d,
+    }
+
+
+class MoneyAmount(TypeDecorator):
+    """نوع عمود محاسبي عشري دقيق (Numeric 18,2) يحفظ المبالغ بعد تقريبها بـ ROUND_HALF_UP ويمنع أخطاء Float"""
+    impl = Numeric(18, 2)
+    cache_ok = True
+
+    def process_bind_param(self, value: Any, dialect: Any) -> Optional[Decimal]:
+        if value is None:
+            return Decimal("0.00")
+        return quantize_money(value)
+
+    def process_result_value(self, value: Any, dialect: Any) -> float:
+        if value is None:
+            return 0.0
+        return float(quantize_money(value))
+
+
+class RateAmount(TypeDecorator):
+    """نوع عمود عشري للكميات والنسب وتكلفة الوحدة بالمتوسط المرجح (Numeric 18,4)"""
+    impl = Numeric(18, 4)
+    cache_ok = True
+
+    def process_bind_param(self, value: Any, dialect: Any) -> Optional[Decimal]:
+        if value is None:
+            return Decimal("0.0000")
+        return quantize_rate(value)
+
+    def process_result_value(self, value: Any, dialect: Any) -> float:
+        if value is None:
+            return 0.0
+        return float(quantize_rate(value))
+
+
+# =============================================================================
+# 0.ب دوال التشفير والتجزئة الآمنة لرموز الدخول (PIN Hashing - PBKDF2-HMAC-SHA256)
 # =============================================================================
 
 PIN_HASH_PREFIX = "pbkdf2_sha256$"
+LEGACY_COMPROMISED_PINS = {"1234", "1111", "2222", "3333", "5555", "0000", "123456", "654321"}
+
+
+def generate_random_pin(length: int = 6) -> str:
+    """توليد رمز دخول سري عشوائي آمن криптоغرافياً (CSPRNG) غير متوقع"""
+    rng = secrets.SystemRandom()
+    while True:
+        pin = "".join(str(rng.randrange(0, 10)) for _ in range(max(6, length)))
+        if pin not in LEGACY_COMPROMISED_PINS and len(set(pin)) >= 3:
+            return pin
+
+
+def is_compromised_or_weak_pin(plain_pin: str) -> bool:
+    """فحص ما إذا كان الرمز السري من الرموز الافتراضية المكشوفة سابقاً أو ضعيفاً"""
+    cand = str(plain_pin or "").strip()
+    if len(cand) < 6 or cand in LEGACY_COMPROMISED_PINS:
+        return True
+    if len(set(cand)) == 1:
+        return True
+    return False
 
 
 def hash_pin_code(plain_pin: str, salt: Optional[str] = None) -> str:
@@ -42,10 +186,10 @@ def hash_pin_code(plain_pin: str, salt: Optional[str] = None) -> str:
 
 
 def verify_pin_code(plain_pin: str, stored_pin: str) -> bool:
-    """التحقق الآمن من تطابق رمز الدخول السري مع القيمة المخزنة (يدعم التجزئة والترقية الآمنة)"""
+    """التحقق الآمن من تطابق رمز الدخول السري مع القيمة المخزنة (يرفض النسخ المطهرة أو الفارغة)"""
     candidate = str(plain_pin or "").strip()
     stored = str(stored_pin or "").strip()
-    if not candidate or not stored:
+    if not candidate or not stored or stored == "REDACTED_IN_BACKUP":
         return False
     if stored.startswith(PIN_HASH_PREFIX):
         parts = stored.split("$")
@@ -187,6 +331,7 @@ SYSTEM_MODULES: Dict[str, str] = {
     "mod_journal": "✍️ القيود اليومية ودفتر اليومية",
     "mod_ledger": "📖 كشف الحساب وميزان المراجعة",
     "mod_statements": "🏛️ القوائم المالية والزكاة والضريبة",
+    "mod_audit_log": "🔍 سجل التدقيق الرقابي للقراءة فقط (ZATCA Audit Log)",
     "mod_settings": "🌳 شجرة الحسابات، الإعدادات، وصلاحيات المستخدمين",
 }
 
@@ -205,7 +350,9 @@ SYSTEM_ACTIONS: Dict[str, str] = {
     "act_manage_payroll": "إدارة سجل الموظفين واعتماد وصرف مسير الرواتب الشهري",
     "act_manage_coa": "إضافة حسابات فرعية في شجرة الحسابات وإدارة مراكز التكلفة",
     "act_cpa_profiles": "حفظ وتعديل قوالب التوجيه المحاسبي في محلل الميزان (CPA)",
-    "act_export_reports": "تصدير التقارير المالية (Excel / Word / PDF) والنسخ الاحتياطي",
+    "act_export_reports": "تصدير التقارير المالية (Excel / Word / PDF)",
+    "act_view_audit_logs": "الاطلاع على سجل التدقيق الرقابي للقراءة فقط وفلترته وتصديره (ZATCA Audit Log)",
+    "act_cloud_backup": "الوصول لمركز Google Drive السحابي وتصدير/استعادة النسخ الاحتياطية",
     "act_close_year": "إقفال السنة المالية وقفل الفترات المحاسبية",
     "act_reset_db": "تصفير الحركات التجريبية لقاعدة البيانات (إجراء حساس)",
     "act_manage_settings": "تعديل إعدادات المنشأة والبيانات الضريبية",
@@ -213,6 +360,83 @@ SYSTEM_ACTIONS: Dict[str, str] = {
 }
 
 ALL_PERMISSION_KEYS: List[str] = list(SYSTEM_MODULES.keys()) + list(SYSTEM_ACTIONS.keys())
+
+
+# تصنيف أنواع المعاملات المالية في سجل التدقيق الرقابي وفق متطلبات الشفافية لهيئة الزكاة والضريبة والجمارك (ZATCA)
+AUDIT_TRANSACTION_TYPES: Dict[str, Dict[str, Any]] = {
+    "SALES_INVOICES": {
+        "label_ar": "🧾 فواتير المبيعات الضريبية (Sales Invoices)",
+        "tables": {"sales_invoices"},
+        "action_keywords": ("SALES_INVOICE",),
+    },
+    "PURCHASE_INVOICES": {
+        "label_ar": "📥 فواتير المشتريات الضريبية (Purchase Invoices)",
+        "tables": {"purchase_invoices"},
+        "action_keywords": ("PURCHASE_INVOICE",),
+    },
+    "CREDIT_DEBIT_NOTES": {
+        "label_ar": "🔄 الإشعارات الدائنة والمدينة والمرتجعات (Credit & Debit Notes)",
+        "tables": {"credit_debit_notes"},
+        "action_keywords": ("CREDIT_NOTE", "DEBIT_NOTE", "CREDIT_DEBIT_NOTE"),
+    },
+    "CASH_BANK_VOUCHERS": {
+        "label_ar": "💸 سندات القبض والصرف والخزينة (Cash & Bank Vouchers)",
+        "tables": {"cash_vouchers"},
+        "action_keywords": ("VOUCHER", "CASH_VOUCHER"),
+    },
+    "JOURNAL_ENTRIES": {
+        "label_ar": "✍️ قيود اليومية العامة والتسويات وعكس القيود (Journal Entries)",
+        "tables": {"journal_entries"},
+        "action_keywords": ("JOURNAL", "APPROVE_DRAFT", "REVERSE_JOURNAL", "BANK_RECONCILIATION"),
+    },
+    "INVENTORY_WAREHOUSES": {
+        "label_ar": "📦 المخزون والتسويات الجردية والمستودعات (Inventory & Warehouses)",
+        "tables": {"inventory_transactions", "products", "warehouse_stocks", "warehouses"},
+        "action_keywords": ("INVENTORY", "WAREHOUSE", "PRODUCT"),
+    },
+    "FIXED_ASSETS_PAYROLL": {
+        "label_ar": "🏗️ الأصول الثابتة والإهلاك ومسيرات الرواتب (Assets & Payroll)",
+        "tables": {"fixed_assets", "payroll_runs", "employees"},
+        "action_keywords": ("ASSET", "DEPRECIATION", "PAYROLL", "EMPLOYEE"),
+    },
+    "PARTIES_ACCOUNTS": {
+        "label_ar": "👥 العملاء والموردون وشجرة الحسابات (Parties & COA)",
+        "tables": {"customers", "suppliers", "accounts", "cost_centers"},
+        "action_keywords": ("CUSTOMER", "SUPPLIER", "ACCOUNT", "COST_CENTER"),
+    },
+    "FISCAL_CLOSING": {
+        "label_ar": "🔒 إقفال الفترات والسنوات المالية (Fiscal Period Closing)",
+        "tables": {"fiscal_periods"},
+        "action_keywords": ("CLOSE_FISCAL", "FISCAL_PERIOD"),
+    },
+    "SECURITY_SETTINGS": {
+        "label_ar": "⚙️ إعدادات المنشأة والأمن وصلاحيات المستخدمين (Settings & Security)",
+        "tables": {"company_settings", "app_users", "custom_role_templates"},
+        "action_keywords": ("USER", "LOGIN", "PIN", "SETTINGS", "ROLE_TEMPLATE", "RESET"),
+    },
+}
+
+
+def classify_audit_transaction_type(table_name: Optional[str], action: Optional[str]) -> str:
+    """تصنيف سجل التدقيق الرقابي إلى نوع معاملة مالية معياري لغايات الفلترة والتقارير الرقابية"""
+    tbl = (table_name or "").strip().lower()
+    act = (action or "").strip().upper()
+
+    for tx_key, meta in AUDIT_TRANSACTION_TYPES.items():
+        if tbl in meta["tables"]:
+            return tx_key
+    for tx_key, meta in AUDIT_TRANSACTION_TYPES.items():
+        if any(kw in act for kw in meta["action_keywords"]):
+            return tx_key
+    return "SECURITY_SETTINGS"
+
+
+def get_audit_transaction_type_label(tx_type_key: str) -> str:
+    """إرجاع المسمى العربي الواضح لنوع المعاملة المالية في سجل التدقيق"""
+    meta = AUDIT_TRANSACTION_TYPES.get((tx_type_key or "").strip().upper())
+    if meta:
+        return meta["label_ar"]
+    return "📋 معاملات أخرى (Other Transactions)"
 
 
 def get_default_permissions_for_role(role: Any) -> Dict[str, bool]:
@@ -240,8 +464,8 @@ def get_default_permissions_for_role(role: Any) -> Dict[str, bool]:
     if role_str == UserRole.AUDITOR.value:
         for k in [
             "mod_dashboard", "mod_cpa", "mod_assets_hr", "mod_control",
-            "mod_ledger", "mod_statements", "mod_settings",
-            "act_cpa_profiles", "act_export_reports"
+            "mod_ledger", "mod_statements", "mod_audit_log", "mod_settings",
+            "act_cpa_profiles", "act_export_reports", "act_view_audit_logs"
         ]:
             base[k] = True
         return base
@@ -278,7 +502,7 @@ class CompanySettings(Base):
     phone = Column(String(50), nullable=True, default="+966 11 000 0000")
     email = Column(String(100), nullable=True, default="finance@mizanpro.sa")
     currency = Column(String(20), nullable=False, default="ريال")
-    default_vat_rate = Column(Float, nullable=False, default=0.15)
+    default_vat_rate = Column(RateAmount(), nullable=False, default=Decimal("0.1500"))
     fiscal_year = Column(Integer, nullable=False, default=2026)
     updated_at = Column(DateTime, default=utc_now, onupdate=utc_now)
 
@@ -292,9 +516,10 @@ class AppUser(Base):
     full_name_ar = Column(String(255), nullable=False)
     job_title = Column(String(150), nullable=True, default="مسؤول مالي")
     role = Column(SQLEnum(UserRole), default=UserRole.ADMIN, nullable=False)
-    pin_code = Column(String(255), default=lambda: hash_pin_code("1234"), nullable=False)
+    pin_code = Column(String(255), default=lambda: hash_pin_code(generate_random_pin(6)), nullable=False)
+    must_change_pin = Column(Boolean, default=True, nullable=False)
     permissions_json = Column(Text, nullable=True)  # JSON dict of custom permissions {perm_key: bool}
-    max_discount_pct = Column(Float, default=100.0, nullable=False)  # سقف نسبة الخصم المسموح بها للمستخدم (%)
+    max_discount_pct = Column(MoneyAmount(), default=Decimal("100.00"), nullable=False)  # سقف نسبة الخصم المسموح بها للمستخدم (%)
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=utc_now, nullable=False)
 
@@ -422,8 +647,8 @@ class JournalEntry(Base):
     description = Column(String(500), nullable=False)
     status = Column(SQLEnum(EntryStatus), default=EntryStatus.POSTED, nullable=False)
 
-    total_debit = Column(Float, default=0.0, nullable=False)
-    total_credit = Column(Float, default=0.0, nullable=False)
+    total_debit = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    total_credit = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
 
     is_reversal = Column(Boolean, default=False, nullable=False)
     reversed_entry_id = Column(Integer, ForeignKey("journal_entries.id"), nullable=True)
@@ -448,8 +673,8 @@ class JournalLine(Base):
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True)
     supplier_id = Column(Integer, ForeignKey("suppliers.id"), nullable=True)
 
-    debit = Column(Float, default=0.0, nullable=False)
-    credit = Column(Float, default=0.0, nullable=False)
+    debit = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    credit = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
     description = Column(String(255), nullable=True)
 
     entry = relationship("JournalEntry", back_populates="lines")
@@ -458,16 +683,28 @@ class JournalLine(Base):
 
 
 class AuditLog(Base):
-    """جدول سجل الرقابة والتدقيق (Immutable Audit Trail)"""
+    """
+    جدول سجل الرقابة والتدقيق الإلزامي للقراءة فقط (ZATCA Read-Only / Append-Only Immutable Audit Trail)
+    يوثق كل عملية إنشاء أو تعديل أو عكس للمعاملات المالية مع الطابع الزمني الدقيق ومعرف المستخدم وبصمة التشفير المتسلسلة.
+    """
     __tablename__ = "audit_logs"
 
     id = Column(Integer, primary_key=True, index=True)
-    table_name = Column(String(50), nullable=False)
-    record_id = Column(Integer, nullable=False)
-    action = Column(String(50), nullable=False)
-    performed_by = Column(String(100), default="مدير النظام (Admin)", nullable=True)
-    timestamp = Column(DateTime, default=utc_now, nullable=False)
+    table_name = Column(String(50), nullable=False, index=True)
+    record_id = Column(Integer, nullable=False, index=True)
+    action = Column(String(50), nullable=False, index=True)
+    user_id = Column(String(64), default="USR-001", nullable=False, index=True)
+    username = Column(String(100), default="admin", nullable=True, index=True)
+    performed_by = Column(String(150), default="مدير النظام (Admin)", nullable=True)
+    timestamp = Column(DateTime, default=utc_now, nullable=False, index=True)
+    reference_number = Column(String(100), nullable=True, index=True)
+    financial_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=True)
+    old_values_json = Column(Text, nullable=True)
+    new_values_json = Column(Text, nullable=True)
     details = Column(Text, nullable=True)
+    previous_hash = Column(String(64), default=AUDIT_GENESIS_HASH, nullable=False)
+    entry_hash = Column(String(64), nullable=True, index=True)
+
 
 
 # =============================================================================
@@ -487,7 +724,7 @@ class Customer(Base):
     phone = Column(String(50), nullable=True)
     email = Column(String(100), nullable=True)
     address = Column(String(255), nullable=True)
-    credit_limit = Column(Float, default=0.0, nullable=False)
+    credit_limit = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
 
     account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
@@ -525,11 +762,11 @@ class Product(Base):
     category = Column(String(100), default="عام", nullable=True)
     unit = Column(String(50), default="حبة", nullable=False)
 
-    stock_quantity = Column(Float, default=0.0, nullable=False)
-    reorder_level = Column(Float, default=5.0, nullable=False)
-    cost_price = Column(Float, default=0.0, nullable=False)
-    sale_price = Column(Float, default=0.0, nullable=False)
-    tax_rate = Column(Float, default=0.15, nullable=False)
+    stock_quantity = Column(RateAmount(), default=Decimal("0.0000"), nullable=False)
+    reorder_level = Column(RateAmount(), default=Decimal("5.0000"), nullable=False)
+    cost_price = Column(RateAmount(), default=Decimal("0.0000"), nullable=False)
+    sale_price = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    tax_rate = Column(RateAmount(), default=Decimal("0.1500"), nullable=False)
 
     is_service = Column(Boolean, default=False, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
@@ -548,12 +785,12 @@ class InventoryTransaction(Base):
     tx_type = Column(SQLEnum(InventoryTxType), nullable=False)
     reference_number = Column(String(50), nullable=False)
 
-    quantity_in = Column(Float, default=0.0, nullable=False)
-    quantity_out = Column(Float, default=0.0, nullable=False)
-    balance_after = Column(Float, default=0.0, nullable=False)
+    quantity_in = Column(RateAmount(), default=Decimal("0.0000"), nullable=False)
+    quantity_out = Column(RateAmount(), default=Decimal("0.0000"), nullable=False)
+    balance_after = Column(RateAmount(), default=Decimal("0.0000"), nullable=False)
 
-    unit_cost = Column(Float, default=0.0, nullable=False)
-    total_cost = Column(Float, default=0.0, nullable=False)
+    unit_cost = Column(RateAmount(), default=Decimal("0.0000"), nullable=False)
+    total_cost = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
 
     journal_entry_id = Column(Integer, ForeignKey("journal_entries.id"), nullable=True)
     notes = Column(String(255), nullable=True)
@@ -584,12 +821,12 @@ class SalesInvoice(Base):
     payment_method = Column(SQLEnum(PaymentMethod), default=PaymentMethod.CASH, nullable=False)
     invoice_type = Column(SQLEnum(InvoiceType), default=InvoiceType.SIMPLIFIED, nullable=False)
 
-    subtotal = Column(Float, default=0.0, nullable=False)
-    discount_amount = Column(Float, default=0.0, nullable=False)
-    taxable_amount = Column(Float, default=0.0, nullable=False)
-    vat_amount = Column(Float, default=0.0, nullable=False)
-    grand_total = Column(Float, default=0.0, nullable=False)
-    total_cost = Column(Float, default=0.0, nullable=False)
+    subtotal = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    discount_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    taxable_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    vat_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    grand_total = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    total_cost = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
 
     journal_entry_id = Column(Integer, ForeignKey("journal_entries.id"), nullable=True)
     cogs_entry_id = Column(Integer, ForeignKey("journal_entries.id"), nullable=True)
@@ -614,15 +851,15 @@ class SalesInvoiceItem(Base):
     product_id = Column(Integer, ForeignKey("products.id"), nullable=True)
 
     item_name = Column(String(255), nullable=False)
-    quantity = Column(Float, default=1.0, nullable=False)
-    unit_price = Column(Float, default=0.0, nullable=False)
-    cost_price = Column(Float, default=0.0, nullable=False)
-    discount = Column(Float, default=0.0, nullable=False)
+    quantity = Column(RateAmount(), default=Decimal("1.0000"), nullable=False)
+    unit_price = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    cost_price = Column(RateAmount(), default=Decimal("0.0000"), nullable=False)
+    discount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
 
-    taxable_amount = Column(Float, default=0.0, nullable=False)
-    tax_rate = Column(Float, default=0.15, nullable=False)
-    tax_amount = Column(Float, default=0.0, nullable=False)
-    total_with_tax = Column(Float, default=0.0, nullable=False)
+    taxable_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    tax_rate = Column(RateAmount(), default=Decimal("0.1500"), nullable=False)
+    tax_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    total_with_tax = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
 
     invoice = relationship("SalesInvoice", back_populates="items")
     product = relationship("Product", back_populates="invoice_items")
@@ -645,13 +882,14 @@ class PurchaseInvoice(Base):
 
     payment_method = Column(SQLEnum(PaymentMethod), default=PaymentMethod.CREDIT, nullable=False)
 
-    subtotal = Column(Float, default=0.0, nullable=False)
-    discount_amount = Column(Float, default=0.0, nullable=False)
-    taxable_amount = Column(Float, default=0.0, nullable=False)
-    vat_amount = Column(Float, default=0.0, nullable=False)
-    grand_total = Column(Float, default=0.0, nullable=False)
+    subtotal = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    discount_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    taxable_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    vat_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    grand_total = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
 
     journal_entry_id = Column(Integer, ForeignKey("journal_entries.id"), nullable=True)
+    qr_code_base64 = Column(Text, nullable=True)
     notes = Column(String(500), nullable=True)
     created_at = Column(DateTime, default=utc_now, nullable=False)
 
@@ -670,14 +908,14 @@ class PurchaseInvoiceItem(Base):
     product_id = Column(Integer, ForeignKey("products.id"), nullable=True)
 
     item_name = Column(String(255), nullable=False)
-    quantity = Column(Float, default=1.0, nullable=False)
-    unit_price = Column(Float, default=0.0, nullable=False)
-    discount = Column(Float, default=0.0, nullable=False)
+    quantity = Column(RateAmount(), default=Decimal("1.0000"), nullable=False)
+    unit_price = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    discount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
 
-    taxable_amount = Column(Float, default=0.0, nullable=False)
-    tax_rate = Column(Float, default=0.15, nullable=False)
-    tax_amount = Column(Float, default=0.0, nullable=False)
-    total_with_tax = Column(Float, default=0.0, nullable=False)
+    taxable_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    tax_rate = Column(RateAmount(), default=Decimal("0.1500"), nullable=False)
+    tax_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    total_with_tax = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
 
     invoice = relationship("PurchaseInvoice", back_populates="items")
     product = relationship("Product")
@@ -708,11 +946,11 @@ class CreditDebitNote(Base):
     payment_method = Column(SQLEnum(PaymentMethod), default=PaymentMethod.CREDIT, nullable=False)
     reason = Column(String(255), nullable=False, default="مرتجع بضاعة طبقاً للاتفاق")
 
-    subtotal = Column(Float, default=0.0, nullable=False)
-    taxable_amount = Column(Float, default=0.0, nullable=False)
-    vat_amount = Column(Float, default=0.0, nullable=False)
-    grand_total = Column(Float, default=0.0, nullable=False)
-    total_cost_reversal = Column(Float, default=0.0, nullable=False)
+    subtotal = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    taxable_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    vat_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    grand_total = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    total_cost_reversal = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
 
     journal_entry_id = Column(Integer, ForeignKey("journal_entries.id"), nullable=True)
     cogs_entry_id = Column(Integer, ForeignKey("journal_entries.id"), nullable=True)
@@ -733,14 +971,14 @@ class CreditDebitNoteItem(Base):
     product_id = Column(Integer, ForeignKey("products.id"), nullable=True)
 
     item_name = Column(String(255), nullable=False)
-    quantity = Column(Float, default=1.0, nullable=False)
-    unit_price = Column(Float, default=0.0, nullable=False)
-    cost_price = Column(Float, default=0.0, nullable=False)
+    quantity = Column(RateAmount(), default=Decimal("1.0000"), nullable=False)
+    unit_price = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    cost_price = Column(RateAmount(), default=Decimal("0.0000"), nullable=False)
 
-    taxable_amount = Column(Float, default=0.0, nullable=False)
-    tax_rate = Column(Float, default=0.15, nullable=False)
-    tax_amount = Column(Float, default=0.0, nullable=False)
-    total_with_tax = Column(Float, default=0.0, nullable=False)
+    taxable_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    tax_rate = Column(RateAmount(), default=Decimal("0.1500"), nullable=False)
+    tax_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    total_with_tax = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
 
     note = relationship("CreditDebitNote", back_populates="items")
     product = relationship("Product")
@@ -764,9 +1002,9 @@ class CashVoucher(Base):
     target_account_code = Column(String(50), nullable=False)
     party_name = Column(String(255), nullable=False)
 
-    amount_before_vat = Column(Float, default=0.0, nullable=False)
-    vat_amount = Column(Float, default=0.0, nullable=False)
-    total_amount = Column(Float, default=0.0, nullable=False)
+    amount_before_vat = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    vat_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    total_amount = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
 
     reference_number = Column(String(100), nullable=True)
     description = Column(String(500), nullable=False)
@@ -793,13 +1031,13 @@ class FixedAsset(Base):
     category = Column(String(100), nullable=False, default="السيارات ووسائل النقل")
     purchase_date = Column(Date, default=date.today, nullable=False)
 
-    purchase_cost = Column(Float, default=0.0, nullable=False)
-    salvage_value = Column(Float, default=0.0, nullable=False)
-    useful_life_years = Column(Float, default=5.0, nullable=False)
-    depreciation_rate = Column(Float, default=0.20, nullable=False)
+    purchase_cost = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    salvage_value = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    useful_life_years = Column(RateAmount(), default=Decimal("5.0000"), nullable=False)
+    depreciation_rate = Column(RateAmount(), default=Decimal("0.2000"), nullable=False)
 
-    accumulated_depreciation = Column(Float, default=0.0, nullable=False)
-    net_book_value = Column(Float, default=0.0, nullable=False)
+    accumulated_depreciation = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    net_book_value = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
 
     asset_account_code = Column(String(50), default="120103", nullable=False)
     accum_dep_account_code = Column(String(50), default="120203", nullable=False)
@@ -823,10 +1061,10 @@ class Employee(Base):
     is_saudi = Column(Boolean, default=True, nullable=False)
     join_date = Column(Date, default=date(2024, 1, 1), nullable=False)
 
-    basic_salary = Column(Float, default=0.0, nullable=False)
-    housing_allowance = Column(Float, default=0.0, nullable=False)
-    transport_allowance = Column(Float, default=0.0, nullable=False)
-    other_allowance = Column(Float, default=0.0, nullable=False)
+    basic_salary = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    housing_allowance = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    transport_allowance = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    other_allowance = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
 
     cost_center_id = Column(Integer, ForeignKey("cost_centers.id"), nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
@@ -845,11 +1083,11 @@ class PayrollRun(Base):
     payment_method = Column(SQLEnum(PaymentMethod), default=PaymentMethod.BANK, nullable=False)
 
     employees_count = Column(Integer, default=0, nullable=False)
-    total_gross_salaries = Column(Float, default=0.0, nullable=False)
-    total_gosi_employee = Column(Float, default=0.0, nullable=False)
-    total_gosi_employer = Column(Float, default=0.0, nullable=False)
-    total_eos_accrual = Column(Float, default=0.0, nullable=False)
-    net_paid_salaries = Column(Float, default=0.0, nullable=False)
+    total_gross_salaries = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    total_gosi_employee = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    total_gosi_employer = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    total_eos_accrual = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
+    net_paid_salaries = Column(MoneyAmount(), default=Decimal("0.00"), nullable=False)
 
     journal_entry_id = Column(Integer, ForeignKey("journal_entries.id"), nullable=True)
     notes = Column(String(500), nullable=True)
@@ -877,7 +1115,370 @@ class WarehouseStock(Base):
     id = Column(Integer, primary_key=True, index=True)
     warehouse_id = Column(Integer, ForeignKey("warehouses.id"), nullable=False)
     product_id = Column(Integer, ForeignKey("products.id"), nullable=False)
-    quantity = Column(Float, default=0.0, nullable=False)
+    quantity = Column(RateAmount(), default=Decimal("0.0000"), nullable=False)
 
     warehouse = relationship("Warehouse")
     product = relationship("Product")
+
+
+# =============================================================================
+# 7. محرك الحماية الصارمة لسجل التدقيق للقراءة فقط (ZATCA Read-Only Audit Engine)
+# =============================================================================
+
+def compute_audit_entry_hash(
+    previous_hash: Optional[str],
+    timestamp: Optional[datetime],
+    user_id: Optional[str],
+    username: Optional[str],
+    performed_by: Optional[str],
+    table_name: Optional[str],
+    record_id: Optional[int],
+    action: Optional[str],
+    reference_number: Optional[str] = None,
+    financial_amount: Any = 0.0,
+    details: Optional[str] = None,
+) -> str:
+    """حساب البصمة التشفيرية المتسلسلة (SHA-256 Chain Hash) لسجل التدقيق لمنع أي تلاعب أو تعديل لاحق"""
+    prev_h = (previous_hash or AUDIT_GENESIS_HASH).strip()
+    if isinstance(timestamp, datetime):
+        ts_str = timestamp.strftime("%Y-%m-%dT%H:%M:%S")
+    else:
+        ts_str = str(timestamp or "").strip().replace(" ", "T")[:19]
+    uid_str = str(user_id or "USR-001").strip()
+    uname_str = str(username or "admin").strip()
+    actor_str = str(performed_by or "").strip()
+    tbl_str = str(table_name or "").strip()
+    rec_str = str(record_id if record_id is not None else 0)
+    act_str = str(action or "").strip()
+    ref_str = str(reference_number or "").strip()
+    amt_str = f"{quantize_money(financial_amount):.2f}"
+    det_str = str(details or "").strip()
+
+    canonical_payload = (
+        f"{prev_h}|{ts_str}|{uid_str}|{uname_str}|{actor_str}|"
+        f"{tbl_str}|{rec_str}|{act_str}|{ref_str}|{amt_str}|{det_str}"
+    )
+    return hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+
+
+def resolve_audit_user_identity(
+    conn_or_session: Any,
+    performed_by: Optional[str] = None,
+    explicit_user_id: Optional[str] = None,
+    explicit_username: Optional[str] = None,
+) -> Tuple[str, str, str]:
+    """
+    استخلاص وتوحيد معرف المستخدم (User ID) واسم الدخول (Username) والاسم الكامل (Performed By)
+    لكل حركة مالية مسجلة في سجل التدقيق الرقابي لضمان المساءلة التامة وفق متطلبات ZATCA.
+    """
+    info_dict = getattr(conn_or_session, "info", {}) or {}
+    raw_actor = (
+        performed_by
+        or info_dict.get("audit_performed_by")
+        or info_dict.get("performed_by")
+        or "مدير النظام (Admin)"
+    ).strip()
+    uid = (
+        explicit_user_id
+        or info_dict.get("audit_user_id")
+        or info_dict.get("user_id")
+        or ""
+    ).strip()
+    uname = (
+        explicit_username
+        or info_dict.get("audit_username")
+        or info_dict.get("username")
+        or ""
+    ).strip()
+
+    # استخراج اسم المستخدم إذا كان مكتوباً بصيغة "الاسم الكامل (username)"
+    paren_match = re.search(r"\(([^()]+)\)", raw_actor)
+    candidate_uname = paren_match.group(1).strip().lower() if paren_match else raw_actor.lower()
+    clean_name_part = re.sub(r"\s*\([^()]+\)\s*", "", raw_actor).strip()
+
+    if conn_or_session is not None and (not uid or uid == "USR-001" or not uname):
+        try:
+            rows = conn_or_session.execute(
+                text("SELECT id, username, full_name_ar FROM app_users")
+            ).fetchall()
+            matched_row = None
+            for r_id, r_uname, r_fname in rows:
+                r_uname_l = (r_uname or "").strip().lower()
+                r_fname_s = (r_fname or "").strip()
+                if uname and r_uname_l == uname.lower():
+                    matched_row = (r_id, r_uname, r_fname_s)
+                    break
+                if candidate_uname and r_uname_l == candidate_uname:
+                    matched_row = (r_id, r_uname, r_fname_s)
+                    break
+                if clean_name_part and (r_fname_s == clean_name_part or clean_name_part in r_fname_s or r_fname_s in clean_name_part):
+                    matched_row = (r_id, r_uname, r_fname_s)
+                    break
+            if matched_row:
+                if not explicit_user_id and not info_dict.get("audit_user_id"):
+                    uid = f"USR-{int(matched_row[0]):03d}"
+                uname = matched_row[1]
+                if not raw_actor:
+                    raw_actor = f"{matched_row[2]} ({matched_row[1]})"
+        except Exception:
+            pass
+
+    if not uid:
+        uid = "USR-001"
+        uname = uname or "admin"
+    if not uname:
+        uname = candidate_uname if (candidate_uname and candidate_uname.isascii()) else "admin"
+
+    return uid, uname, raw_actor
+
+
+@event.listens_for(AuditLog, "before_insert")
+def _audit_log_before_insert(mapper, connection, target: AuditLog):
+    """توليد الطابع الزمني ومعرف المستخدم والبصمة التشفيرية المتسلسلة تلقائياً عند إدراج أي سجل تدقيق"""
+    if target.timestamp is None:
+        target.timestamp = utc_now()
+
+    uid, uname, actor = resolve_audit_user_identity(
+        connection,
+        performed_by=target.performed_by,
+        explicit_user_id=target.user_id if target.user_id != "USR-001" else None,
+        explicit_username=target.username if target.username != "admin" else None,
+    )
+    target.user_id = uid
+    target.username = uname
+    target.performed_by = actor
+
+    if target.financial_amount is None:
+        target.financial_amount = Decimal("0.00")
+    else:
+        target.financial_amount = quantize_money(target.financial_amount)
+
+    # جلب آخر بصمة تشفيرية في جدول audit_logs لبناء سلسلة التشفير غير القابلة للتلاعب (مع دعم الإدراج المتعدد في نفس الدفعة)
+    db_last_hash = AUDIT_GENESIS_HASH
+    try:
+        last_row = connection.execute(
+            text("SELECT entry_hash FROM audit_logs WHERE entry_hash IS NOT NULL AND entry_hash != '' ORDER BY id DESC LIMIT 1")
+        ).fetchone()
+        if last_row and last_row[0]:
+            db_last_hash = str(last_row[0])
+    except Exception:
+        db_last_hash = AUDIT_GENESIS_HASH
+
+    if (
+        connection.info.get("_pending_audit_db_base") == db_last_hash
+        and connection.info.get("_pending_audit_hash")
+    ):
+        prev_hash = str(connection.info["_pending_audit_hash"])
+    else:
+        prev_hash = db_last_hash
+        connection.info["_pending_audit_db_base"] = db_last_hash
+
+    target.previous_hash = prev_hash
+    target.entry_hash = compute_audit_entry_hash(
+        previous_hash=target.previous_hash,
+        timestamp=target.timestamp,
+        user_id=target.user_id,
+        username=target.username,
+        performed_by=target.performed_by,
+        table_name=target.table_name,
+        record_id=target.record_id,
+        action=target.action,
+        reference_number=target.reference_number,
+        financial_amount=target.financial_amount,
+        details=target.details,
+    )
+    connection.info["_pending_audit_hash"] = target.entry_hash
+
+
+
+@event.listens_for(AuditLog, "before_update")
+def _prevent_audit_log_update(mapper, connection, target: AuditLog):
+    """منع تعديل أي سجل تدقيق على مستوى ORM نهائياً (Read-Only Compliance)"""
+    raise AuditLogReadOnlyError(
+        "ZATCA_AUDIT_LOG_READ_ONLY: سجل التدقيق الرقابي للقراءة والإضافة فقط (Read-Only) ويُمنع تعديل أي سجل رقابي مسجل."
+    )
+
+
+@event.listens_for(AuditLog, "before_delete")
+def _prevent_audit_log_delete(mapper, connection, target: AuditLog):
+    """منع حذف أي سجل تدقيق على مستوى ORM نهائياً (Read-Only Compliance)"""
+    raise AuditLogReadOnlyError(
+        "ZATCA_AUDIT_LOG_READ_ONLY: سجل التدقيق الرقابي للقراءة والإضافة فقط (Read-Only) ويُمنع حذف أي سجل رقابي مسجل."
+    )
+
+
+def _serialize_audit_val(val: Any) -> Any:
+    if val is None:
+        return None
+    if isinstance(val, (datetime, date)):
+        return val.isoformat()
+    if isinstance(val, Decimal):
+        return float(quantize_money(val))
+    if isinstance(val, enum.Enum):
+        return val.value
+    if isinstance(val, (int, float, bool, str)):
+        return val
+    return str(val)
+
+
+def _extract_model_ref_and_amount(obj: Any) -> Tuple[Optional[str], Decimal]:
+    ref = (
+        getattr(obj, "entry_number", None)
+        or getattr(obj, "invoice_number", None)
+        or getattr(obj, "note_number", None)
+        or getattr(obj, "voucher_number", None)
+        or getattr(obj, "payroll_number", None)
+        or getattr(obj, "reference_number", None)
+        or getattr(obj, "asset_code", None)
+        or getattr(obj, "code", None)
+        or (f"FY-{obj.year}" if hasattr(obj, "year") else None)
+    )
+    amt_raw = (
+        getattr(obj, "grand_total", None)
+        if getattr(obj, "grand_total", None) is not None else
+        getattr(obj, "total_debit", None)
+        if getattr(obj, "total_debit", None) is not None else
+        getattr(obj, "total_amount", None)
+        if getattr(obj, "total_amount", None) is not None else
+        getattr(obj, "total_cost", None)
+        if getattr(obj, "total_cost", None) is not None else
+        getattr(obj, "net_paid_salaries", None)
+        if getattr(obj, "net_paid_salaries", None) is not None else
+        getattr(obj, "purchase_cost", None)
+        if getattr(obj, "purchase_cost", None) is not None else
+        Decimal("0.00")
+    )
+    return (str(ref) if ref else None), quantize_money(amt_raw)
+
+
+_TRACKED_FINANCIAL_MODELS = (
+    JournalEntry,
+    SalesInvoice,
+    PurchaseInvoice,
+    CreditDebitNote,
+    CashVoucher,
+    InventoryTransaction,
+    PayrollRun,
+    FixedAsset,
+    FiscalPeriod,
+)
+
+
+@event.listens_for(Session, "before_flush")
+def _capture_financial_modifications_before_flush(session: Session, flush_context, instances):
+    """
+    اعتراض وتوثيق أي تعديل أو حذف على الجداول والمعاملات المالية تلقائياً في سجل التدقيق (AuditLog)
+    مع حفظ القيم السابقة واللاحقة (Before/After Snapshot) والطابع الزمني ومعرف المستخدم.
+    """
+    if session.info.get("_suppress_auto_audit"):
+        return
+
+    # منع أي محاولة لحذف أو تعديل كائن AuditLog داخل الجلسة
+    for obj in list(session.deleted):
+        if isinstance(obj, AuditLog):
+            raise AuditLogReadOnlyError(
+                "ZATCA_AUDIT_LOG_READ_ONLY: سجل التدقيق الرقابي للقراءة والإضافة فقط (Read-Only) ويُمنع حذف أي سجل رقابي."
+            )
+    for obj in list(session.dirty):
+        if isinstance(obj, AuditLog) and session.is_modified(obj, include_collections=False):
+            raise AuditLogReadOnlyError(
+                "ZATCA_AUDIT_LOG_READ_ONLY: سجل التدقيق الرقابي للقراءة والإضافة فقط (Read-Only) ويُمنع تعديل أي سجل رقابي."
+            )
+
+    queued_audit_keys = {
+        (a.table_name, a.record_id, a.action)
+        for a in session.new
+        if isinstance(a, AuditLog)
+    }
+    queued_table_rec = {
+        (a.table_name, a.record_id)
+        for a in session.new
+        if isinstance(a, AuditLog)
+    }
+
+    default_actor = session.info.get("audit_performed_by") or session.info.get("performed_by") or "مدير النظام (Admin)"
+    default_uid = session.info.get("audit_user_id") or session.info.get("user_id") or "USR-001"
+    default_uname = session.info.get("audit_username") or session.info.get("username") or "admin"
+
+    # رصد كافة التعديلات على السجلات المالية القائمة (Dirty Financial Objects)
+    for obj in list(session.dirty):
+        if not isinstance(obj, _TRACKED_FINANCIAL_MODELS):
+            continue
+        if not session.is_modified(obj, include_collections=False):
+            continue
+
+        insp = sa_inspect(obj)
+        tbl_name = obj.__tablename__
+        rec_id = getattr(obj, "id", None) or 0
+
+        db_current_row: Optional[Dict[str, Any]] = None
+        if rec_id:
+            try:
+                row_res = session.connection().execute(
+                    text(f"SELECT * FROM {tbl_name} WHERE id = :rid"),
+                    {"rid": int(rec_id)},
+                ).mappings().first()
+                if row_res:
+                    db_current_row = dict(row_res)
+            except Exception:
+                db_current_row = None
+
+        old_vals: Dict[str, Any] = {}
+        new_vals: Dict[str, Any] = {}
+        for attr in insp.mapper.column_attrs:
+            col_key = attr.key
+            hist = getattr(insp.attrs, col_key).history
+            if hist.has_changes():
+                if hist.deleted:
+                    old_v = hist.deleted[0]
+                elif db_current_row is not None and col_key in db_current_row:
+                    old_v = db_current_row[col_key]
+                else:
+                    old_v = None
+                new_v = hist.added[0] if hist.added else getattr(obj, col_key, None)
+                if _serialize_audit_val(old_v) != _serialize_audit_val(new_v):
+                    old_vals[col_key] = _serialize_audit_val(old_v)
+                    new_vals[col_key] = _serialize_audit_val(new_v)
+
+        if not new_vals:
+            continue
+
+        # إذا كان هناك سجل AuditLog مضاف يدوياً في نفس الدفعة لنفس السجل، نثريه بالقيم السابقة واللاحقة والمرجع والمبلغ
+        matching_manual = [
+            a for a in session.new
+            if isinstance(a, AuditLog) and a.table_name == tbl_name and a.record_id == rec_id
+        ]
+        ref_no, fin_amt = _extract_model_ref_and_amount(obj)
+        if matching_manual:
+            for m_log in matching_manual:
+                if not m_log.old_values_json:
+                    m_log.old_values_json = json.dumps(old_vals, ensure_ascii=False)
+                if not m_log.new_values_json:
+                    m_log.new_values_json = json.dumps(new_vals, ensure_ascii=False)
+                if not m_log.reference_number and ref_no:
+                    m_log.reference_number = ref_no
+                if (m_log.financial_amount is None or quantize_money(m_log.financial_amount) == Decimal("0.00")) and fin_amt > Decimal("0.00"):
+                    m_log.financial_amount = fin_amt
+            continue
+
+        action_code = f"MODIFY_{tbl_name.upper()}"
+        if (tbl_name, rec_id, action_code) in queued_audit_keys or (tbl_name, rec_id) in queued_table_rec:
+            continue
+
+        changed_fields_str = ", ".join(f"{k}: {old_vals.get(k)} -> {new_vals.get(k)}" for k in new_vals.keys())
+        session.add(AuditLog(
+            table_name=tbl_name,
+            record_id=rec_id,
+            action=action_code,
+            user_id=default_uid,
+            username=default_uname,
+            performed_by=default_actor,
+            timestamp=utc_now(),
+            reference_number=ref_no,
+            financial_amount=fin_amt,
+            old_values_json=json.dumps(old_vals, ensure_ascii=False),
+            new_values_json=json.dumps(new_vals, ensure_ascii=False),
+            details=f"Modified {tbl_name} (ID={rec_id}, Ref={ref_no or '-'}): {changed_fields_str}",
+        ))
+        queued_audit_keys.add((tbl_name, rec_id, action_code))
+

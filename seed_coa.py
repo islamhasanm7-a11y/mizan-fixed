@@ -5,17 +5,75 @@ MizanPro - Standard Chart of Accounts, Safe Auto-Migration & Master Data Seeder
 """
 
 import json
+import os
 from datetime import date
+from typing import Optional
 from sqlalchemy import text, inspect
-from database import engine, Base, SessionLocal
+from database import engine, Base, SessionLocal, ACTIVE_DB_PATH
 from models import (
     Account, AccountType, AccountSubType, NaturalBalance,
     FiscalPeriod, CostCenter, CompanySettings, Customer,
     Supplier, Product, FixedAsset, Employee, AppUser, UserRole,
     CustomRoleTemplate, Warehouse, WarehouseStock, JournalEntry, JournalLine,
     InventoryTransaction, InventoryTxType, DocumentType, EntryStatus, AuditLog,
-    get_default_permissions_for_role, hash_pin_code, PIN_HASH_PREFIX
+    get_default_permissions_for_role, hash_pin_code, verify_pin_code,
+    generate_random_pin, LEGACY_COMPROMISED_PINS, PIN_HASH_PREFIX,
+    AUDIT_GENESIS_HASH, compute_audit_entry_hash, resolve_audit_user_identity
 )
+
+BOOTSTRAP_PIN_FILE = "/tmp/mizanpro_initial_admin_pin.json"
+
+
+def get_initial_admin_bootstrap_pin() -> Optional[str]:
+    """استرجاع الرمز العشوائي المؤقت لمدير النظام عند التهيئة الأولى فقط (معزول لكل قاعدة بيانات)"""
+    if not os.path.exists(BOOTSTRAP_PIN_FILE):
+        return None
+    try:
+        with open(BOOTSTRAP_PIN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        db_key = os.path.abspath(ACTIVE_DB_PATH)
+        if isinstance(data, dict) and db_key in data:
+            return data[db_key]
+        return data.get("admin_bootstrap_pin")
+    except Exception:
+        return None
+
+
+def _save_initial_admin_bootstrap_pin(pin_str: str) -> None:
+    try:
+        data = {}
+        if os.path.exists(BOOTSTRAP_PIN_FILE):
+            try:
+                with open(BOOTSTRAP_PIN_FILE, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        data = loaded
+            except Exception:
+                data = {}
+        db_key = os.path.abspath(ACTIVE_DB_PATH)
+        data[db_key] = pin_str
+        with open(BOOTSTRAP_PIN_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.chmod(BOOTSTRAP_PIN_FILE, 0o600)
+    except Exception:
+        pass
+
+
+def clear_initial_admin_bootstrap_pin() -> None:
+    """مسح الرمز التمهيدي المؤقت لقاعدة البيانات النشطة فور قيام المدير بتغيير رمزه عند أول دخول"""
+    if not os.path.exists(BOOTSTRAP_PIN_FILE):
+        return
+    try:
+        with open(BOOTSTRAP_PIN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        db_key = os.path.abspath(ACTIVE_DB_PATH)
+        if isinstance(data, dict):
+            data.pop(db_key, None)
+            data.pop("admin_bootstrap_pin", None)
+            with open(BOOTSTRAP_PIN_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+    except Exception:
+        pass
 
 
 def _safe_auto_migrate():
@@ -43,8 +101,55 @@ def _safe_auto_migrate():
 
         if "audit_logs" in existing_tables:
             cols = [c["name"] for c in inspector.get_columns("audit_logs")]
+            # إيقاف تريجرات منع التعديل مؤقتاً فقط أثناء الترقية المعمارية لملء البصمات التشفيرية للسجلات القديمة
+            conn.execute(text("DROP TRIGGER IF EXISTS trg_audit_logs_readonly_update"))
+            conn.execute(text("DROP TRIGGER IF EXISTS trg_audit_logs_readonly_delete"))
             if "performed_by" not in cols:
-                conn.execute(text("ALTER TABLE audit_logs ADD COLUMN performed_by VARCHAR(100) DEFAULT 'مدير النظام (Admin)'"))
+                conn.execute(text("ALTER TABLE audit_logs ADD COLUMN performed_by VARCHAR(150) DEFAULT 'مدير النظام (Admin)'"))
+            if "user_id" not in cols:
+                conn.execute(text("ALTER TABLE audit_logs ADD COLUMN user_id VARCHAR(64) NOT NULL DEFAULT 'USR-001'"))
+            if "username" not in cols:
+                conn.execute(text("ALTER TABLE audit_logs ADD COLUMN username VARCHAR(100) DEFAULT 'admin'"))
+            if "reference_number" not in cols:
+                conn.execute(text("ALTER TABLE audit_logs ADD COLUMN reference_number VARCHAR(100)"))
+            if "financial_amount" not in cols:
+                conn.execute(text("ALTER TABLE audit_logs ADD COLUMN financial_amount NUMERIC(18, 2) DEFAULT 0.00"))
+            if "old_values_json" not in cols:
+                conn.execute(text("ALTER TABLE audit_logs ADD COLUMN old_values_json TEXT"))
+            if "new_values_json" not in cols:
+                conn.execute(text("ALTER TABLE audit_logs ADD COLUMN new_values_json TEXT"))
+            if "previous_hash" not in cols:
+                conn.execute(text(f"ALTER TABLE audit_logs ADD COLUMN previous_hash VARCHAR(64) NOT NULL DEFAULT '{AUDIT_GENESIS_HASH}'"))
+            if "entry_hash" not in cols:
+                conn.execute(text("ALTER TABLE audit_logs ADD COLUMN entry_hash VARCHAR(64)"))
+
+            # استكمال البصمة التشفيرية ومعرف المستخدم للسجلات التاريخية التي أنشئت قبل الترقية
+            unhashed = conn.execute(
+                text("SELECT id, timestamp, user_id, username, performed_by, table_name, record_id, action, reference_number, financial_amount, details, previous_hash, entry_hash FROM audit_logs ORDER BY id ASC")
+            ).fetchall()
+            running_prev = AUDIT_GENESIS_HASH
+            for row in unhashed:
+                r_id, r_ts, r_uid, r_uname, r_actor, r_tbl, r_rec, r_act, r_ref, r_amt, r_det, r_prev, r_ehash = row
+                uid_val, uname_val, actor_val = resolve_audit_user_identity(conn, performed_by=r_actor, explicit_user_id=r_uid, explicit_username=r_uname)
+                computed_h = compute_audit_entry_hash(
+                    previous_hash=running_prev,
+                    timestamp=r_ts,
+                    user_id=uid_val,
+                    username=uname_val,
+                    performed_by=actor_val,
+                    table_name=r_tbl,
+                    record_id=r_rec,
+                    action=r_act,
+                    reference_number=r_ref,
+                    financial_amount=r_amt or 0.0,
+                    details=r_det,
+                )
+                if not r_ehash or not r_uid or r_prev != running_prev or r_ehash != computed_h:
+                    conn.execute(
+                        text("UPDATE audit_logs SET user_id = :uid, username = :uname, performed_by = :actor, previous_hash = :ph, entry_hash = :eh WHERE id = :id"),
+                        {"uid": uid_val, "uname": uname_val, "actor": actor_val, "ph": running_prev, "eh": computed_h, "id": r_id}
+                    )
+                running_prev = computed_h
 
         if "sales_invoices" in existing_tables:
             cols = [c["name"] for c in inspector.get_columns("sales_invoices")]
@@ -55,6 +160,8 @@ def _safe_auto_migrate():
             cols = [c["name"] for c in inspector.get_columns("purchase_invoices")]
             if "cost_center_id" not in cols:
                 conn.execute(text("ALTER TABLE purchase_invoices ADD COLUMN cost_center_id INTEGER"))
+            if "qr_code_base64" not in cols:
+                conn.execute(text("ALTER TABLE purchase_invoices ADD COLUMN qr_code_base64 TEXT"))
 
         if "cash_vouchers" in existing_tables:
             cols = [c["name"] for c in inspector.get_columns("cash_vouchers")]
@@ -75,7 +182,29 @@ def _safe_auto_migrate():
             if "permissions_json" not in cols:
                 conn.execute(text("ALTER TABLE app_users ADD COLUMN permissions_json TEXT"))
             if "max_discount_pct" not in cols:
-                conn.execute(text("ALTER TABLE app_users ADD COLUMN max_discount_pct FLOAT NOT NULL DEFAULT 100.0"))
+                conn.execute(text("ALTER TABLE app_users ADD COLUMN max_discount_pct NUMERIC(18, 2) NOT NULL DEFAULT 100.0"))
+            if "must_change_pin" not in cols:
+                conn.execute(text("ALTER TABLE app_users ADD COLUMN must_change_pin BOOLEAN NOT NULL DEFAULT 1"))
+
+        # تفعيل تريجرات الحماية الصارمة على مستوى قاعدة البيانات (SQLite Triggers) لمنع أي تعديل أو حذف في audit_logs
+        if "audit_logs" in inspect(conn).get_table_names():
+            conn.execute(text("""
+                CREATE TRIGGER IF NOT EXISTS trg_audit_logs_readonly_update
+                BEFORE UPDATE ON audit_logs
+                BEGIN
+                    SELECT RAISE(ABORT, 'ZATCA_AUDIT_LOG_READ_ONLY: Modification of audit_logs is strictly prohibited for ZATCA compliance.');
+                END;
+            """))
+            conn.execute(text("""
+                CREATE TRIGGER IF NOT EXISTS trg_audit_logs_readonly_delete
+                BEFORE DELETE ON audit_logs
+                BEGIN
+                    SELECT RAISE(ABORT, 'ZATCA_AUDIT_LOG_READ_ONLY: Deletion of audit_logs is strictly prohibited for ZATCA compliance.');
+                END;
+            """))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_audit_logs_user_id ON audit_logs (user_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_audit_logs_timestamp ON audit_logs (timestamp)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_audit_logs_table_rec ON audit_logs (table_name, record_id)"))
 
         # إنشاء الفهارس الضرورية لتسريع الاستعلامات ومنع التكرار
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_journal_lines_entry_id ON journal_lines (entry_id)"))
@@ -510,30 +639,40 @@ def init_database_and_seed(seed_demo_data: bool = True):
             db.add(settings)
             db.commit()
 
-        # 2. المستخدمون الافتراضيون والصلاحيات القابلة للتخصيص الحر (مع تشفير الـ PIN)
+        # 2. المستخدمون الافتراضيون والصلاحيات القابلة للتخصيص الحر (مع توليد رمز عشوائي آمن وإلزام تغييره عند أول دخول)
         if db.query(AppUser).count() == 0:
+            admin_random_pin = generate_random_pin(6)
+            _save_initial_admin_bootstrap_pin(admin_random_pin)
             default_users = [
                 AppUser(
                     username="admin", full_name_ar="المدير المالي / مدير النظام",
-                    job_title="المدير المالي التنفيذي", role=UserRole.ADMIN, pin_code=hash_pin_code("1234"),
+                    job_title="المدير المالي التنفيذي", role=UserRole.ADMIN,
+                    pin_code=hash_pin_code(admin_random_pin),
+                    must_change_pin=True,
                     permissions_json=json.dumps(get_default_permissions_for_role(UserRole.ADMIN), ensure_ascii=False),
                     max_discount_pct=100.0
                 ),
                 AppUser(
                     username="cpa_auditor", full_name_ar="المراجع القانوني المعتمد (CPA)",
-                    job_title="مراجع حسابات قانوني", role=UserRole.AUDITOR, pin_code=hash_pin_code("1111"),
+                    job_title="مراجع حسابات قانوني", role=UserRole.AUDITOR,
+                    pin_code=hash_pin_code(generate_random_pin(6)),
+                    must_change_pin=True,
                     permissions_json=json.dumps(get_default_permissions_for_role(UserRole.AUDITOR), ensure_ascii=False),
                     max_discount_pct=0.0
                 ),
                 AppUser(
                     username="accountant", full_name_ar="المحاسب العام",
-                    job_title="محاسب مالي أول", role=UserRole.ACCOUNTANT, pin_code=hash_pin_code("2222"),
+                    job_title="محاسب مالي أول", role=UserRole.ACCOUNTANT,
+                    pin_code=hash_pin_code(generate_random_pin(6)),
+                    must_change_pin=True,
                     permissions_json=json.dumps(get_default_permissions_for_role(UserRole.ACCOUNTANT), ensure_ascii=False),
                     max_discount_pct=25.0
                 ),
                 AppUser(
                     username="sales", full_name_ar="مسؤول المبيعات والمستودع",
-                    job_title="مسؤول مبيعات ومخازن", role=UserRole.SALES, pin_code=hash_pin_code("3333"),
+                    job_title="مسؤول مبيعات ومخازن", role=UserRole.SALES,
+                    pin_code=hash_pin_code(generate_random_pin(6)),
+                    must_change_pin=True,
                     permissions_json=json.dumps(get_default_permissions_for_role(UserRole.SALES), ensure_ascii=False),
                     max_discount_pct=10.0
                 ),
@@ -541,14 +680,45 @@ def init_database_and_seed(seed_demo_data: bool = True):
             db.add_all(default_users)
             db.commit()
         else:
-            # ترقية المستخدمين الحاليين وتشفير أي رمز PIN مخزن كنص واضح
+            # مراجعة أمنية شاملة: تدوير أي رموز دخول افتراضية أو مكشوفة في قاعدة البيانات وإلزام تغييرها عند أول دخول
             for u in db.query(AppUser).all():
                 if not u.permissions_json:
                     u.permissions_json = json.dumps(get_default_permissions_for_role(u.role), ensure_ascii=False)
+                elif u.role == UserRole.ADMIN:
+                    try:
+                        p_dict = json.loads(u.permissions_json)
+                        p_dict["act_cloud_backup"] = True
+                        u.permissions_json = json.dumps(p_dict, ensure_ascii=False)
+                    except Exception:
+                        u.permissions_json = json.dumps(get_default_permissions_for_role(UserRole.ADMIN), ensure_ascii=False)
                 if not u.job_title:
                     u.job_title = "مسؤول مالي"
-                if u.pin_code and not str(u.pin_code).startswith(PIN_HASH_PREFIX):
+
+                has_compromised_pin = (
+                    not u.pin_code
+                    or u.pin_code == "REDACTED_IN_BACKUP"
+                    or any(verify_pin_code(bad_p, u.pin_code) for bad_p in LEGACY_COMPROMISED_PINS)
+                )
+                if has_compromised_pin:
+                    rotated_pin = generate_random_pin(6)
+                    u.pin_code = hash_pin_code(rotated_pin)
+                    u.must_change_pin = True
+                    if u.username == "admin":
+                        _save_initial_admin_bootstrap_pin(rotated_pin)
+                    db.add(AuditLog(
+                        table_name="app_users",
+                        record_id=u.id or 1,
+                        action="ROTATE_COMPROMISED_PIN",
+                        performed_by="System Security Guard",
+                        details=f"Rotated legacy/exposed PIN for user '{u.username}' and enforced must_change_pin=True."
+                    ))
+                elif not str(u.pin_code).startswith(PIN_HASH_PREFIX):
                     u.pin_code = hash_pin_code(u.pin_code)
+
+                if u.username == "admin" and u.must_change_pin and not get_initial_admin_bootstrap_pin():
+                    rotated_pin = generate_random_pin(6)
+                    u.pin_code = hash_pin_code(rotated_pin)
+                    _save_initial_admin_bootstrap_pin(rotated_pin)
             db.commit()
 
         # 2.ب زراعة قوالب الأدوار الوظيفية المخصصة الافتراضية
@@ -724,6 +894,10 @@ def init_database_and_seed(seed_demo_data: bool = True):
                 ),
             ])
             db.commit()
+
+        # 9. ترقية وتدقيق كافة رموز QR في المستندات المسجلة لتتوافق مع المرحلة الثانية (ZATCA Phase 2 Tags 1-9)
+        from zatca_phase2_validator import ZATCAPhase2Validator
+        ZATCAPhase2Validator.audit_all_database_documents(db, auto_upgrade_phase2=True)
 
     except Exception as e:
         db.rollback()

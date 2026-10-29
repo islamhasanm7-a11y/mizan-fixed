@@ -10,7 +10,7 @@ import re
 from datetime import date, datetime, time
 from typing import List, Dict, Any, Optional
 import pandas as pd
-from sqlalchemy import func, and_
+from sqlalchemy import func, and_, text
 from sqlalchemy.orm import Session
 
 from models import (
@@ -24,9 +24,22 @@ from models import (
     CashVoucher, VoucherType, VoucherPartyType, CompanySettings,
     FixedAsset, Employee, PayrollRun, AppUser, UserRole, TBMappingProfile,
     CustomRoleTemplate, Warehouse, WarehouseStock, ALL_PERMISSION_KEYS,
-    get_default_permissions_for_role, hash_pin_code, utc_now
+    get_default_permissions_for_role, hash_pin_code, utc_now,
+    to_decimal, quantize_money, round_money, quantize_rate, round_rate,
+    calculate_line_and_tax_amounts, is_compromised_or_weak_pin, generate_random_pin,
+    AuditLogReadOnlyError, AUDIT_GENESIS_HASH, compute_audit_entry_hash, resolve_audit_user_identity,
+    AUDIT_TRANSACTION_TYPES, classify_audit_transaction_type, get_audit_transaction_type_label
+)
+from seed_coa import clear_initial_admin_bootstrap_pin
+from zatca_phase2_validator import ZATCAPhase2Validator, ZATCA_GENESIS_PIH
+from zatca_qr_tlv import (
+    ZATCATLVEncodingError,
+    ZATCATLVQRGenerator,
+    decode_zatca_tlv_qr_base64,
+    generate_zatca_tlv_qr_base64,
 )
 import json
+
 
 
 class LedgerValidationError(Exception):
@@ -38,34 +51,74 @@ class LedgerService:
     """محرك العمليات المتكامل لنظام MizanPro ERP"""
 
     # =========================================================================
-    # 1. خوارزمية تشفير وتوليد الـ QR Code لهيئة الزكاة والضريبة والجمارك (ZATCA TLV)
+    # 1. خوارزمية تشفير وتوليد الـ QR Code لهيئة الزكاة والضريبة والجمارك (ZATCA Phase 2 TLV Tags 1-9)
     # =========================================================================
     @staticmethod
     def generate_zatca_qr_code(
         seller_name: str,
         vat_number: str,
-        invoice_datetime: datetime,
-        total_amount: float,
-        vat_amount: float
+        invoice_datetime: Optional[Any] = None,
+        total_amount: Optional[Any] = None,
+        vat_amount: Optional[Any] = None,
+        doc_number: str = "INV-2026-0001",
+        doc_type_code: str = "388",
+        subtype_code: str = "0200000",
+        buyer_name: str = "عميل نقدي",
+        buyer_vat: str = "",
+        icv: int = 1,
+        pih: str = ZATCA_GENESIS_PIH,
+        timestamp: Optional[Any] = None,
+        invoice_total: Optional[Any] = None,
+        vat_total: Optional[Any] = None,
+        phase2: bool = True,
     ) -> str:
-        """توليد رمز الاستجابة السريعة (QR Code) المشفر بصيغة TLV Base64 وفق متطلبات ZATCA"""
-        def get_tlv_tag(tag_num: int, value: str) -> bytes:
-            val_bytes = (value or "").encode("utf-8")[:255]
-            length = len(val_bytes)
-            return bytes([tag_num, length]) + val_bytes
+        """
+        توليد رمز الاستجابة السريعة (QR Code) المشفر بصيغة TLV Base64 المتوافق مع
+        المرحلة الثانية لهيئة الزكاة والضريبة والجمارك (ZATCA Phase 2 Integration - Tags 1..9)
+        شاملاً: اسم البائع (Tag 1)، الرقم الضريبي (Tag 2)، الطابع الزمني (Tag 3)،
+        إجمالي الفاتورة (Tag 4)، مبلغ الضريبة (Tag 5)، وحقول التشفير للمرحلة الثانية (Tags 6..9).
+        """
+        effective_ts = timestamp if timestamp is not None else invoice_datetime
+        effective_total = invoice_total if invoice_total is not None else total_amount
+        effective_vat = vat_total if vat_total is not None else vat_amount
+        try:
+            return generate_zatca_tlv_qr_base64(
+                seller_name=seller_name,
+                vat_number=vat_number,
+                timestamp=effective_ts,
+                invoice_total=effective_total,
+                vat_total=effective_vat,
+                phase2=phase2,
+                doc_number=doc_number,
+                doc_type_code=doc_type_code,
+                subtype_code=subtype_code,
+                buyer_name=buyer_name,
+                buyer_vat=buyer_vat,
+                icv=icv,
+                pih=pih,
+            )
+        except ZATCATLVEncodingError as exc:
+            raise LedgerValidationError(str(exc)) from exc
 
-        iso_dt = invoice_datetime.strftime("%Y-%m-%dT%H:%M:%SZ")
-        str_total = f"{total_amount:.2f}"
-        str_vat = f"{vat_amount:.2f}"
+    @staticmethod
+    def decode_zatca_qr_code(tlv_base64: Optional[str]) -> Dict[str, Any]:
+        """فك تشفير وتحليل باركود ZATCA TLV Base64 واستخراج الحقول (Tags 1..9)"""
+        return decode_zatca_tlv_qr_base64(tlv_base64)
 
-        tlv_data = (
-            get_tlv_tag(1, seller_name) +
-            get_tlv_tag(2, vat_number) +
-            get_tlv_tag(3, iso_dt) +
-            get_tlv_tag(4, str_total) +
-            get_tlv_tag(5, str_vat)
+    @staticmethod
+    def generate_invoice_zatca_qr_bundle(
+        invoice_obj: Any,
+        settings: Optional[CompanySettings] = None,
+        icv: int = 1,
+        pih: str = ZATCA_GENESIS_PIH,
+    ) -> Dict[str, Any]:
+        """توليد حزمة باركود ZATCA TLV Base64 كاملة مع فك التشفير والتحقق لأي فاتورة"""
+        return ZATCATLVQRGenerator.generate_for_invoice(
+            invoice_obj=invoice_obj,
+            settings=settings,
+            icv=icv,
+            pih=pih,
         )
-        return base64.b64encode(tlv_data).decode("utf-8")
 
     @staticmethod
     def generate_qr_svg_data_uri(tlv_base64: str, size: int = 130) -> str:
@@ -198,6 +251,588 @@ class LedgerService:
     # 2.ب إدارة المستخدمين والتخصيص الحر للصلاحيات (Custom RBAC & User Management)
     # =========================================================================
     @classmethod
+    def record_audit_log(
+        cls,
+        db: Session,
+        table_name: str,
+        record_id: int,
+        action: str,
+        performed_by: Optional[str] = "مدير النظام (Admin)",
+        user_id: Optional[str] = None,
+        username: Optional[str] = None,
+        reference_number: Optional[str] = None,
+        financial_amount: Any = 0.0,
+        old_values: Optional[Dict[str, Any]] = None,
+        new_values: Optional[Dict[str, Any]] = None,
+        details: Optional[str] = None,
+    ) -> AuditLog:
+        """
+        تسجيل قيد تدقيق رقابي غير قابل للتعديل أو الحذف (ZATCA Read-Only Audit Trail)
+        مع ربطه الإلزامي بمعرف المستخدم (user_id) والطابع الزمني العالمي (UTC Timestamp) وبصمة التشفير المتسلسلة.
+        """
+        uid, uname, actor = resolve_audit_user_identity(
+            db,
+            performed_by=performed_by,
+            explicit_user_id=user_id,
+            explicit_username=username,
+        )
+        db.info["performed_by"] = actor
+        db.info["user_id"] = uid
+        db.info["username"] = uname
+
+        log_entry = AuditLog(
+            table_name=table_name,
+            record_id=int(record_id or 0),
+            action=action,
+            user_id=uid,
+            username=uname,
+            performed_by=actor,
+            timestamp=utc_now(),
+            reference_number=reference_number,
+            financial_amount=quantize_money(financial_amount),
+            old_values_json=json.dumps(old_values, ensure_ascii=False) if old_values is not None else None,
+            new_values_json=json.dumps(new_values, ensure_ascii=False) if new_values is not None else None,
+            details=details,
+        )
+        db.add(log_entry)
+        return log_entry
+
+    @classmethod
+    def verify_audit_log_integrity(cls, db: Session) -> Dict[str, Any]:
+        """
+        فحص سلامة وعدم التلاعب بسجل التدقيق الرقابي للقراءة فقط (ZATCA Read-Only Audit Trail Verification)
+        عبر التحقق من سلسلة التجزئة التشفيرية (SHA-256 Hash Chain) وتريجرات الحماية في قاعدة البيانات.
+        """
+        logs = db.query(AuditLog).order_by(AuditLog.id.asc()).all()
+        expected_prev = AUDIT_GENESIS_HASH
+        broken_links: List[Dict[str, Any]] = []
+        missing_user_ids = 0
+        missing_timestamps = 0
+
+        for lg in logs:
+            if not lg.user_id or not str(lg.user_id).strip():
+                missing_user_ids += 1
+            if lg.timestamp is None:
+                missing_timestamps += 1
+
+            computed = compute_audit_entry_hash(
+                previous_hash=lg.previous_hash or expected_prev,
+                timestamp=lg.timestamp,
+                user_id=lg.user_id,
+                username=lg.username,
+                performed_by=lg.performed_by,
+                table_name=lg.table_name,
+                record_id=lg.record_id,
+                action=lg.action,
+                reference_number=lg.reference_number,
+                financial_amount=lg.financial_amount,
+                details=lg.details,
+            )
+            if (lg.previous_hash and lg.previous_hash != expected_prev) or (lg.entry_hash and lg.entry_hash != computed):
+                broken_links.append({
+                    "id": lg.id,
+                    "action": lg.action,
+                    "table_name": lg.table_name,
+                    "expected_previous_hash": expected_prev,
+                    "actual_previous_hash": lg.previous_hash,
+                    "expected_entry_hash": computed,
+                    "actual_entry_hash": lg.entry_hash,
+                })
+            expected_prev = lg.entry_hash or computed
+
+        triggers = [
+            r[0] for r in db.execute(
+                text("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='audit_logs'")
+            ).fetchall()
+        ]
+        has_readonly_triggers = (
+            "trg_audit_logs_readonly_update" in triggers
+            and "trg_audit_logs_readonly_delete" in triggers
+        )
+
+        is_intact = (
+            len(broken_links) == 0
+            and missing_user_ids == 0
+            and missing_timestamps == 0
+            and has_readonly_triggers
+        )
+        verified_count = max(0, len(logs) - len(broken_links))
+        return {
+            "is_intact": is_intact,
+            "is_read_only_enforced": has_readonly_triggers,
+            "total_records": len(logs),
+            "total_entries": len(logs),
+            "verified_entries": verified_count,
+            "missing_user_ids": missing_user_ids,
+            "missing_user_id_count": missing_user_ids,
+            "missing_timestamps": missing_timestamps,
+            "missing_timestamp_count": missing_timestamps,
+            "broken_chain_links": broken_links,
+            "latest_chain_hash": expected_prev,
+            "triggers": triggers,
+            "status_ar": (
+                "سجل تدقيق محمي للقراءة فقط (Read-Only) وسلسلة SHA-256 سليمة 100% ✅"
+                if is_intact else
+                "تنبيه أمني: تم رصد خلل في سلسلة التدقيق أو تريجرات الحماية ❌"
+            ),
+        }
+
+    @classmethod
+    def is_user_authorized_for_audit_logs(cls, db: Session, user_or_actor: Optional[Any]) -> bool:
+        """
+        التحقق من امتلاك المستخدم لصلاحية الاطلاع على سجل التدقيق الرقابي للقراءة فقط (ZATCA Audit Log).
+        يُسمح لمدير النظام (ADMIN) والمراجع القانوني (AUDITOR) وأي مستخدم يمتلك صلاحية
+        `act_view_audit_logs` أو `mod_audit_log`.
+        """
+        if user_or_actor is None:
+            return False
+
+        if isinstance(user_or_actor, AppUser):
+            if not user_or_actor.is_active:
+                return False
+            role_val = user_or_actor.role.value if hasattr(user_or_actor.role, "value") else str(user_or_actor.role)
+            if role_val in (UserRole.ADMIN.value, UserRole.AUDITOR.value):
+                return True
+            return (
+                user_or_actor.has_permission("act_view_audit_logs")
+                or user_or_actor.has_permission("mod_audit_log")
+            )
+
+        if isinstance(user_or_actor, dict):
+            if not user_or_actor.get("is_active", True):
+                return False
+            role_val = str(user_or_actor.get("role") or "")
+            if role_val in (UserRole.ADMIN.value, UserRole.AUDITOR.value):
+                return True
+            perms = user_or_actor.get("permissions") or {}
+            return bool(perms.get("act_view_audit_logs") or perms.get("mod_audit_log"))
+
+        raw = str(user_or_actor).strip()
+        if not raw or "مقفل" in raw:
+            return False
+
+        user_obj: Optional[AppUser] = None
+        if raw.isdigit():
+            user_obj = db.query(AppUser).filter(AppUser.id == int(raw)).first()
+        elif raw.upper().startswith("USR-") and raw[4:].isdigit():
+            user_obj = db.query(AppUser).filter(AppUser.id == int(raw[4:])).first()
+        else:
+            paren_m = re.search(r"\(([^()]+)\)", raw)
+            cand_uname = paren_m.group(1).strip().lower() if paren_m else raw.lower()
+            clean_name = re.sub(r"\s*\([^()]+\)\s*", "", raw).strip()
+            user_obj = db.query(AppUser).filter(
+                (func.lower(AppUser.username) == cand_uname)
+                | (func.lower(AppUser.username) == raw.lower())
+                | (AppUser.full_name_ar == raw)
+                | (AppUser.full_name_ar == clean_name)
+            ).first()
+
+        if user_obj is None:
+            return False
+        return cls.is_user_authorized_for_audit_logs(db, user_obj)
+
+    @classmethod
+    def query_audit_logs(
+        cls,
+        db: Session,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None,
+        user_filter: Optional[str] = None,
+        transaction_type: Optional[str] = None,
+        table_name: Optional[str] = None,
+        action: Optional[str] = None,
+        search_query: Optional[str] = None,
+        min_amount: Optional[float] = None,
+        only_modifications: bool = False,
+        requesting_user: Optional[Any] = None,
+        limit: int = 1000,
+    ) -> Dict[str, Any]:
+        """
+        استعلام وفلترة سجل التدقيق الرقابي للقراءة فقط (Read-Only ZATCA Audit Log Filter & Query Engine)
+        مع دعم الفلترة حسب:
+        1. نطاق التاريخ (start_date .. end_date)
+        2. المستخدم (user_id / username / performed_by)
+        3. نوع المعاملة المالية (transaction_type: فواتير مبيعات، مشتريات، إشعارات، سندات، قيود، مخزون، أصول/رواتب، إلخ أو اسم الجدول/الإجراء)
+        4. الجدول المالي أو نوع الإجراء التفصيلي أو البحث النصي.
+        يتحقق إلزامياً من صلاحية المستخدم الطالب عند تمرير `requesting_user`.
+        """
+        if requesting_user is not None and not cls.is_user_authorized_for_audit_logs(db, requesting_user):
+            raise LedgerValidationError(
+                "ZATCA_AUDIT_ACCESS_DENIED: عذراً، الوصول إلى سجل التدقيق الرقابي للقراءة فقط مقيد بالمستخدمين المخولين "
+                "(مدير النظام، المراجع القانوني CPA، أو حاملي صلاحية act_view_audit_logs)."
+            )
+
+        def _parse_date_bound(d_val: Any) -> Optional[date]:
+            if d_val is None or d_val == "":
+                return None
+            if isinstance(d_val, datetime):
+                return d_val.date()
+            if isinstance(d_val, date):
+                return d_val
+            s_val = str(d_val).strip()[:10]
+            try:
+                return datetime.strptime(s_val, "%Y-%m-%d").date()
+            except Exception as exc:
+                raise LedgerValidationError(f"صيغة التاريخ غير صالحة ({d_val}). يرجى استخدام YYYY-MM-DD.") from exc
+
+        s_date = _parse_date_bound(start_date)
+        e_date = _parse_date_bound(end_date)
+        if s_date and e_date and s_date > e_date:
+            raise LedgerValidationError(
+                f"نطاق التاريخ غير صالح: تاريخ البداية ({s_date}) لا يمكن أن يكون بعد تاريخ النهاية ({e_date})."
+            )
+
+        all_logs_asc = db.query(AuditLog).order_by(AuditLog.id.asc()).all()
+
+        # بناء خريطة التحقق التشفيري لكل سجل + جمع خيارات الفلترة المتاحة
+        hash_valid_map: Dict[int, bool] = {}
+        expected_prev = AUDIT_GENESIS_HASH
+        available_users_set = set()
+        available_tables_set = set()
+        available_actions_set = set()
+        min_db_date: Optional[date] = None
+        max_db_date: Optional[date] = None
+
+        for lg in all_logs_asc:
+            computed_h = compute_audit_entry_hash(
+                previous_hash=lg.previous_hash or expected_prev,
+                timestamp=lg.timestamp,
+                user_id=lg.user_id,
+                username=lg.username,
+                performed_by=lg.performed_by,
+                table_name=lg.table_name,
+                record_id=lg.record_id,
+                action=lg.action,
+                reference_number=lg.reference_number,
+                financial_amount=lg.financial_amount,
+                details=lg.details,
+            )
+            is_link_ok = (
+                (not lg.previous_hash or lg.previous_hash == expected_prev)
+                and (not lg.entry_hash or lg.entry_hash == computed_h)
+            )
+            hash_valid_map[lg.id] = bool(is_link_ok)
+            expected_prev = lg.entry_hash or computed_h
+
+            uid_val = (lg.user_id or "USR-001").strip()
+            uname_val = (lg.username or "admin").strip()
+            available_users_set.add(f"{uid_val} ({uname_val})")
+            if lg.table_name:
+                available_tables_set.add(lg.table_name)
+            if lg.action:
+                available_actions_set.add(lg.action)
+            if lg.timestamp:
+                lg_d = lg.timestamp.date() if isinstance(lg.timestamp, datetime) else lg.timestamp
+                if min_db_date is None or lg_d < min_db_date:
+                    min_db_date = lg_d
+                if max_db_date is None or lg_d > max_db_date:
+                    max_db_date = lg_d
+
+        # تطبيع معايير الفلترة
+        u_norm = (user_filter or "").strip()
+        if u_norm in ("", "الكل", "ALL", "all", "*"):
+            u_norm = ""
+
+        tx_norm = (transaction_type or "").strip()
+        if tx_norm in ("", "الكل", "ALL", "all", "*") or tx_norm.startswith("الكل"):
+            tx_norm = ""
+        else:
+            # السماح بتمرير المسمى العربي لنوع المعاملة أو المفتاح المعياري
+            for k_tx, meta_tx in AUDIT_TRANSACTION_TYPES.items():
+                if tx_norm.upper() == k_tx or tx_norm == meta_tx["label_ar"]:
+                    tx_norm = k_tx
+                    break
+
+        tbl_norm = (table_name or "").strip().lower()
+        if tbl_norm in ("", "الكل", "all", "*"):
+            tbl_norm = ""
+
+        act_norm = (action or "").strip().upper()
+        if act_norm in ("", "الكل", "ALL", "*"):
+            act_norm = ""
+
+        q_norm = (search_query or "").strip().lower()
+        min_amt_val = float(min_amount) if min_amount is not None and float(min_amount) > 0 else 0.0
+
+        matched_logs: List[AuditLog] = []
+        # الترتيب من الأحدث إلى الأقدم للعرض
+        for lg in reversed(all_logs_asc):
+            lg_dt = lg.timestamp
+            lg_date = lg_dt.date() if isinstance(lg_dt, datetime) else lg_dt
+
+            # 1. فلترة نطاق التاريخ (Date Range Filter)
+            if s_date and (lg_date is None or lg_date < s_date):
+                continue
+            if e_date and (lg_date is None or lg_date > e_date):
+                continue
+
+            # 2. فلترة المستخدم (User Filter: user_id, username, performed_by, or "USR-001 (admin)")
+            if u_norm:
+                u_norm_l = u_norm.lower()
+                uid_s = (lg.user_id or "USR-001").strip()
+                uname_s = (lg.username or "admin").strip()
+                actor_s = (lg.performed_by or "").strip()
+                combined_u = f"{uid_s} ({uname_s})".lower()
+                if not (
+                    u_norm_l == uid_s.lower()
+                    or u_norm_l == uname_s.lower()
+                    or u_norm_l == combined_u
+                    or u_norm_l in combined_u
+                    or u_norm_l in actor_s.lower()
+                ):
+                    continue
+
+            # 3. فلترة نوع المعاملة المالية (Transaction Type Filter)
+            lg_tx_type = classify_audit_transaction_type(lg.table_name, lg.action)
+            if tx_norm:
+                tx_norm_u = tx_norm.upper()
+                if tx_norm_u in AUDIT_TRANSACTION_TYPES:
+                    if lg_tx_type != tx_norm_u:
+                        continue
+                else:
+                    # دعم الفلترة المباشرة باسم الجدول أو نوع الإجراء إذا مرره المستدعي في transaction_type
+                    if (
+                        tx_norm.lower() != (lg.table_name or "").strip().lower()
+                        and tx_norm_u != (lg.action or "").strip().upper()
+                        and tx_norm_u not in (lg.action or "").strip().upper()
+                    ):
+                        continue
+
+            # 4. فلترة الجدول المالي المباشر (Table Filter)
+            if tbl_norm and (lg.table_name or "").strip().lower() != tbl_norm:
+                continue
+
+            # 5. فلترة نوع الإجراء التفصيلي (Action Filter)
+            if act_norm and (lg.action or "").strip().upper() != act_norm:
+                continue
+
+            # 6. فلترة الحد الأدنى للمبلغ المالي
+            amt_f = float(lg.financial_amount or 0.0)
+            if min_amt_val > 0 and amt_f < min_amt_val - 1e-6:
+                continue
+
+            # 7. فلترة عمليات التعديل والعكس فقط (Modifications / Reversals Only)
+            act_u = (lg.action or "").upper()
+            is_mod = bool(
+                lg.old_values_json
+                or act_u.startswith("MODIFY_")
+                or act_u.startswith("UPDATE_")
+                or act_u.startswith("REVERSE_")
+                or act_u.startswith("DELETE_")
+            )
+            if only_modifications and not is_mod:
+                continue
+
+            # 8. البحث النصي الشامل (Search Query)
+            if q_norm:
+                haystack = (
+                    f"{lg.id} {lg.user_id or ''} {lg.username or ''} {lg.performed_by or ''} "
+                    f"{lg.table_name or ''} {lg.action or ''} {lg.reference_number or ''} "
+                    f"{lg.details or ''} {lg.entry_hash or ''} {lg.previous_hash or ''} "
+                    f"{lg.old_values_json or ''} {lg.new_values_json or ''}"
+                ).lower()
+                if q_norm not in haystack:
+                    continue
+
+            matched_logs.append(lg)
+            if limit and len(matched_logs) >= int(limit):
+                break
+
+        records: List[Dict[str, Any]] = []
+        df_rows: List[Dict[str, Any]] = []
+        by_tx_type: Dict[str, Dict[str, Any]] = {}
+        by_user: Dict[str, Dict[str, Any]] = {}
+        total_volume = 0.0
+        modifications_cnt = 0
+        unique_users_matched = set()
+
+        for lg in matched_logs:
+            tx_key = classify_audit_transaction_type(lg.table_name, lg.action)
+            tx_label = get_audit_transaction_type_label(tx_key)
+            ts_str = lg.timestamp.strftime("%Y-%m-%d %H:%M:%S") if lg.timestamp else "-"
+            d_str = lg.timestamp.strftime("%Y-%m-%d") if lg.timestamp else "-"
+            uid_s = lg.user_id or "USR-001"
+            uname_s = lg.username or "admin"
+            actor_s = getattr(lg, "performed_by", None) or "مدير النظام"
+            u_label = f"{uid_s} ({uname_s})"
+            unique_users_matched.add(u_label)
+
+            amt_val = round_money(lg.financial_amount or 0.0)
+            total_volume = round_money(total_volume + amt_val)
+
+            old_dict: Dict[str, Any] = {}
+            new_dict: Dict[str, Any] = {}
+            if lg.old_values_json:
+                try:
+                    parsed_o = json.loads(lg.old_values_json)
+                    if isinstance(parsed_o, dict):
+                        old_dict = parsed_o
+                except Exception:
+                    pass
+            if lg.new_values_json:
+                try:
+                    parsed_n = json.loads(lg.new_values_json)
+                    if isinstance(parsed_n, dict):
+                        new_dict = parsed_n
+                except Exception:
+                    pass
+
+            changed_keys = sorted(set(old_dict.keys()) | set(new_dict.keys()))
+            act_u = (lg.action or "").upper()
+            is_mod_rec = bool(
+                old_dict
+                or act_u.startswith("MODIFY_")
+                or act_u.startswith("UPDATE_")
+                or act_u.startswith("REVERSE_")
+                or act_u.startswith("DELETE_")
+            )
+            if is_mod_rec:
+                modifications_cnt += 1
+
+            is_h_ok = hash_valid_map.get(lg.id, True)
+
+            by_tx_entry = by_tx_type.setdefault(
+                tx_label,
+                {"transaction_type_key": tx_key, "transaction_type_ar": tx_label, "count": 0, "amount": 0.0}
+            )
+            by_tx_entry["count"] += 1
+            by_tx_entry["amount"] = round_money(by_tx_entry["amount"] + amt_val)
+
+            by_u_entry = by_user.setdefault(
+                u_label,
+                {"user_id": uid_s, "username": uname_s, "performed_by": actor_s, "count": 0, "amount": 0.0}
+            )
+            by_u_entry["count"] += 1
+            by_u_entry["amount"] = round_money(by_u_entry["amount"] + amt_val)
+
+            rec_dict = {
+                "id": lg.id,
+                "timestamp_utc": ts_str,
+                "date_only": d_str,
+                "user_id": uid_s,
+                "username": uname_s,
+                "performed_by": actor_s,
+                "user_tag": u_label,
+                "transaction_type_key": tx_key,
+                "transaction_type_ar": tx_label,
+                "table_name": lg.table_name,
+                "record_id": lg.record_id,
+                "action": lg.action,
+                "reference_number": lg.reference_number or "-",
+                "financial_amount": amt_val,
+                "is_modification": is_mod_rec,
+                "old_values": old_dict,
+                "new_values": new_dict,
+                "changed_fields": changed_keys,
+                "previous_hash": lg.previous_hash or AUDIT_GENESIS_HASH,
+                "entry_hash": lg.entry_hash or "",
+                "is_hash_valid": is_h_ok,
+                "details": lg.details or "",
+            }
+            records.append(rec_dict)
+
+            df_rows.append({
+                "رقم العملية": lg.id,
+                "الطابع الزمني (UTC Timestamp)": ts_str,
+                "التاريخ": d_str,
+                "معرف المستخدم (User ID)": uid_s,
+                "اسم الدخول": uname_s,
+                "المسؤول عن العملية": actor_s,
+                "نوع المعاملة المالية": tx_label,
+                "الجدول المالي": lg.table_name,
+                "رقم السجل": lg.record_id,
+                "مرجع المستند": lg.reference_number or "-",
+                "المبلغ المالي (ريال)": f"{amt_val:,.2f}",
+                "نوع الإجراء": lg.action,
+                "سلامة البصمة": "سليمة ✅" if is_h_ok else "خلل ❌",
+                "بصمة التشفير (SHA-256)": (lg.entry_hash[:16] + "...") if lg.entry_hash else "-",
+                "التفاصيل": lg.details or "",
+            })
+
+        tx_type_options = {"ALL": "الكل — جميع أنواع المعاملات المالية"}
+        for k_tx, meta_tx in AUDIT_TRANSACTION_TYPES.items():
+            tx_type_options[k_tx] = meta_tx["label_ar"]
+
+        return {
+            "logs": matched_logs,
+            "records": records,
+            "dataframe": pd.DataFrame(df_rows),
+            "summary": {
+                "total_matched": len(records),
+                "total_in_database": len(all_logs_asc),
+                "total_financial_volume": total_volume,
+                "modifications_count": modifications_cnt,
+                "unique_users_count": len(unique_users_matched),
+                "by_transaction_type": list(by_tx_type.values()),
+                "by_user": list(by_user.values()),
+                "filters_applied": {
+                    "start_date": s_date.isoformat() if s_date else None,
+                    "end_date": e_date.isoformat() if e_date else None,
+                    "user_filter": u_norm or "ALL",
+                    "transaction_type": tx_norm or "ALL",
+                    "table_name": tbl_norm or "ALL",
+                    "action": act_norm or "ALL",
+                    "search_query": q_norm or "",
+                    "only_modifications": bool(only_modifications),
+                },
+            },
+            "filter_options": {
+                "users": ["الكل"] + sorted(available_users_set),
+                "transaction_types": tx_type_options,
+                "tables": ["الكل"] + sorted(available_tables_set),
+                "actions": ["الكل"] + sorted(available_actions_set),
+                "min_date": min_db_date or date.today(),
+                "max_date": max_db_date or date.today(),
+            },
+        }
+
+    @classmethod
+    def export_immutable_audit_pdf(
+        cls,
+        db: Session,
+        start_date: Optional[Any] = None,
+        end_date: Optional[Any] = None,
+        user_filter: Optional[str] = None,
+        transaction_type: Optional[str] = None,
+        table_name: Optional[str] = None,
+        action: Optional[str] = None,
+        search_query: Optional[str] = None,
+        min_amount: Optional[float] = None,
+        only_modifications: bool = False,
+        requesting_user: Optional[Any] = None,
+        auditor_notes: Optional[str] = None,
+        limit: int = 1000,
+    ) -> bytes:
+        """
+        تصدير سجلات التدقيق الرقابي للقراءة فقط بصيغة PDF مؤمّنة وغير قابلة للتعديل (Immutable Read-Only PDF)
+        مع ختم تشفيري مزدوج (SHA-256 Content Seal + Embedded Manifest) لمراجعة المدقق الخارجي ومفتشي ZATCA.
+        """
+        from zatca_audit_pdf import ZATCAAuditPDFExporter
+
+        return ZATCAAuditPDFExporter.generate_immutable_audit_pdf(
+            db=db,
+            start_date=start_date,
+            end_date=end_date,
+            user_filter=user_filter,
+            transaction_type=transaction_type,
+            table_name=table_name,
+            action=action,
+            search_query=search_query,
+            min_amount=min_amount,
+            only_modifications=only_modifications,
+            requesting_user=requesting_user,
+            auditor_notes=auditor_notes,
+            limit=limit,
+        )
+
+    @classmethod
+    def verify_immutable_audit_pdf(cls, pdf_bytes: bytes) -> Dict[str, Any]:
+        """التحقق الجنائي من سلامة وعدم التلاعب بملف PDF المصدّر لسجل التدقيق الرقابي للمراجع الخارجي"""
+        from zatca_audit_pdf import ZATCAAuditPDFExporter
+
+        return ZATCAAuditPDFExporter.verify_immutable_audit_pdf(pdf_bytes)
+
+    @classmethod
     def verify_user_permission(cls, db: Session, performed_by: Optional[str], required_perm: str) -> None:
         """التحقق من صلاحية المستخدم على مستوى طبقة منطق الأعمال (Service Layer RBAC)"""
         if not performed_by:
@@ -213,6 +848,89 @@ class LedgerService:
             raise LedgerValidationError(f"المستخدم [{user.full_name_ar}] لا يمتلك الصلاحية النظامية ({required_perm}) لتنفيذ هذه العملية.")
 
     @classmethod
+    def authenticate_user(cls, db: Session, username: str, plain_pin: str) -> AppUser:
+        """
+        مصادقة المستخدم إلزامياً باسم الدخول ورمز الدخول السري (PIN) بدون كشف قائمة المستخدمين.
+        """
+        uname = (username or "").strip().lower()
+        raw_pin = (plain_pin or "").strip()
+        if not uname or not raw_pin:
+            raise LedgerValidationError("يرجى إدخال اسم المستخدم ورمز الدخول السري (PIN).")
+
+        user = db.query(AppUser).filter(func.lower(AppUser.username) == uname).first()
+        if not user or not user.is_active:
+            raise LedgerValidationError("اسم المستخدم أو رمز الدخول السري غير صحيح، أو أن الحساب موقوف.")
+
+        if not user.verify_pin(raw_pin):
+            db.add(AuditLog(
+                table_name="app_users",
+                record_id=user.id,
+                action="LOGIN_FAILED",
+                performed_by=uname,
+                details=f"Failed PIN authentication attempt for username: {uname}"
+            ))
+            db.commit()
+            raise LedgerValidationError("اسم المستخدم أو رمز الدخول السري غير صحيح.")
+
+        db.add(AuditLog(
+            table_name="app_users",
+            record_id=user.id,
+            action="LOGIN_SUCCESS",
+            performed_by=user.full_name_ar,
+            details=f"Authenticated user: {user.username} (must_change_pin={bool(user.must_change_pin)})"
+        ))
+        db.commit()
+        db.refresh(user)
+        return user
+
+    @classmethod
+    def change_user_pin(
+        cls,
+        db: Session,
+        user_id: int,
+        current_pin: str,
+        new_pin: str,
+        performed_by: Optional[str] = None
+    ) -> AppUser:
+        """
+        تغيير رمز الدخول السري (PIN) للمستخدم مع فرض قوة الرمز ومنع الرموز الضعيفة أو المكشوفة،
+        وإلغاء علامة الإلزام بتغيير الرمز عند أول دخول (must_change_pin = False).
+        """
+        user = db.query(AppUser).filter(AppUser.id == user_id).first()
+        if not user:
+            raise LedgerValidationError("المستخدم غير موجود.")
+
+        if not user.verify_pin(current_pin):
+            raise LedgerValidationError("رمز الدخول السري الحالي غير صحيح.")
+
+        clean_new = (new_pin or "").strip()
+        if clean_new == (current_pin or "").strip():
+            raise LedgerValidationError("رمز الدخول السري الجديد يجب أن يختلف عن الرمز الحالي.")
+
+        if is_compromised_or_weak_pin(clean_new):
+            raise LedgerValidationError(
+                "رمز الدخول السري الجديد ضعيف أو مكشوف (مثل 1234 أو أرقام متكررة). "
+                "يرجى اختيار رمز سري قوي مكون من 6 أرقام غير متكررة."
+            )
+
+        user.pin_code = hash_pin_code(clean_new)
+        user.must_change_pin = False
+
+        if user.username.lower() == "admin":
+            clear_initial_admin_bootstrap_pin()
+
+        db.add(AuditLog(
+            table_name="app_users",
+            record_id=user.id,
+            action="CHANGE_PIN",
+            performed_by=performed_by or user.full_name_ar,
+            details=f"User {user.username} changed PIN and cleared must_change_pin flag."
+        ))
+        db.commit()
+        db.refresh(user)
+        return user
+
+    @classmethod
     def create_or_update_user(
         cls,
         cls_or_db: Optional[Session] = None,
@@ -220,11 +938,12 @@ class LedgerService:
         username: str = "",
         full_name_ar: str = "",
         role: UserRole = UserRole.CUSTOM,
-        pin_code: str = "1234",
+        pin_code: str = "",
         job_title: str = "مسؤول مالي",
         permissions_dict: Optional[Dict[str, bool]] = None,
         max_discount_pct: float = 100.0,
         is_active: bool = True,
+        must_change_pin: Optional[bool] = None,
         performed_by: str = "مدير النظام (Admin)"
     ) -> AppUser:
         """إنشاء مستخدم جديد أو تحديث بياناته مع تشفير الـ PIN وتخصيص كامل لصلاحيات الشاشات والعمليات"""
@@ -259,12 +978,16 @@ class LedgerService:
             user.role = role
             if raw_pin:
                 user.pin_code = hash_pin_code(raw_pin)
+                if must_change_pin is not None:
+                    user.must_change_pin = bool(must_change_pin)
+            elif must_change_pin is not None:
+                user.must_change_pin = bool(must_change_pin)
             user.permissions_json = json.dumps(base_perms, ensure_ascii=False)
-            user.max_discount_pct = float(max_discount_pct)
+            user.max_discount_pct = round_money(max_discount_pct)
             user.is_active = bool(is_active)
         else:
             if not raw_pin:
-                raise LedgerValidationError("رمز الدخول السري (PIN) مطلوب لإنشاء مستخدم جديد.")
+                raw_pin = generate_random_pin(6)
             is_new = True
             user = AppUser(
                 username=uname,
@@ -272,8 +995,9 @@ class LedgerService:
                 job_title=(job_title or "مسؤول مالي").strip(),
                 role=role,
                 pin_code=hash_pin_code(raw_pin),
+                must_change_pin=bool(must_change_pin) if must_change_pin is not None else False,
                 permissions_json=json.dumps(base_perms, ensure_ascii=False),
-                max_discount_pct=float(max_discount_pct),
+                max_discount_pct=round_money(max_discount_pct),
                 is_active=bool(is_active)
             )
             db_sess.add(user)
@@ -518,6 +1242,11 @@ class LedgerService:
     ) -> Customer:
         if not name_ar.strip():
             raise LedgerValidationError("اسم العميل مطلوب.")
+        if vat_number and str(vat_number).strip():
+            v_chk = ZATCAPhase2Validator.validate_saudi_vat_number(vat_number, party_role="BUYER", required=True)
+            if not v_chk["is_valid"]:
+                raise LedgerValidationError(v_chk["message_ar"])
+            vat_number = v_chk["clean_vat"]
 
         ar_acc = db.query(Account).filter(Account.code == "110301").first()
         cust = (
@@ -573,6 +1302,11 @@ class LedgerService:
     ) -> Supplier:
         if not name_ar.strip():
             raise LedgerValidationError("اسم المورد مطلوب.")
+        if vat_number and str(vat_number).strip():
+            v_chk = ZATCAPhase2Validator.validate_saudi_vat_number(vat_number, party_role="SUPPLIER", required=True)
+            if not v_chk["is_valid"]:
+                raise LedgerValidationError(v_chk["message_ar"])
+            vat_number = v_chk["clean_vat"]
 
         ap_acc = db.query(Account).filter(Account.code == "210101").first()
         supp = (
@@ -824,14 +1558,25 @@ class LedgerService:
                 )
                 db.add(jline)
 
-            audit = AuditLog(
+            cls.record_audit_log(
+                db=db,
                 table_name="journal_entries",
                 record_id=entry.id,
                 action="CREATE_AND_POST" if auto_post else "CREATE_DRAFT",
                 performed_by=performed_by,
-                details=f"Entry: {entry_number}, Total: {total_debit:,.2f}, Date: {entry_date}"
+                reference_number=entry_number,
+                financial_amount=total_debit,
+                new_values={
+                    "entry_number": entry_number,
+                    "entry_date": str(entry_date),
+                    "doc_type": doc_type.value,
+                    "status": status.value,
+                    "total_debit": round_money(total_debit),
+                    "total_credit": round_money(total_credit),
+                    "lines_count": len(validated_lines),
+                },
+                details=f"Entry: {entry_number}, Total: {total_debit:,.2f}, Date: {entry_date}",
             )
-            db.add(audit)
 
             if commit:
                 db.commit()
@@ -887,16 +1632,21 @@ class LedgerService:
                 customer_name = cust_obj.name_ar
                 customer_vat_number = cust_obj.vat_number
 
-            if invoice_type == InvoiceType.STANDARD:
-                vat_clean = (customer_vat_number or "").strip()
-                if not vat_clean:
-                    raise LedgerValidationError(
-                        "الفاتورة الضريبية القياسية (B2B) تتطلب إدخال الرقم الضريبي للعميل (وفق متطلبات ZATCA)."
-                    )
-                if not (len(vat_clean) == 15 and vat_clean.isdigit() and vat_clean.startswith("3") and vat_clean.endswith("3")):
-                    raise LedgerValidationError(
-                        "الرقم الضريبي للعميل في الفاتورة القياسية (B2B) يجب أن يتكون من 15 رقماً ويبدأ وينتهي بالرقم 3."
-                    )
+            seller_vat_chk = ZATCAPhase2Validator.validate_saudi_vat_number(seller_vat_number, party_role="SELLER", required=True)
+            if not seller_vat_chk["is_valid"]:
+                raise LedgerValidationError(seller_vat_chk["message_ar"])
+            seller_vat_number = seller_vat_chk["clean_vat"]
+
+            vat_clean = (customer_vat_number or "").strip()
+            if invoice_type == InvoiceType.STANDARD or vat_clean:
+                buyer_vat_chk = ZATCAPhase2Validator.validate_saudi_vat_number(
+                    vat_clean,
+                    party_role="BUYER",
+                    required=(invoice_type == InvoiceType.STANDARD)
+                )
+                if not buyer_vat_chk["is_valid"]:
+                    raise LedgerValidationError(buyer_vat_chk["message_ar"])
+                customer_vat_number = buyer_vat_chk["clean_vat"]
 
             fiscal_year = invoice_date.year
             invoice_number = cls.generate_invoice_number(db, fiscal_year)
@@ -936,17 +1686,20 @@ class LedgerService:
                 rate = float(item.get("tax_rate", prod_obj.tax_rate if prod_obj else settings.default_vat_rate))
                 item_name = item.get("item_name") or (prod_obj.name_ar if prod_obj else "بند مبيعات")
 
-                line_taxable = max(0.0, (qty * price) - disc)
-                line_vat = round(line_taxable * rate, 2)
-                line_total_with_tax = round(line_taxable + line_vat, 2)
-                line_total_cost = round(qty * cost, 2) if (prod_obj and not prod_obj.is_service) else 0.0
+                line_calc = calculate_line_and_tax_amounts(qty, price, disc, rate)
+                line_gross = round_money(line_calc["gross_amount"])
+                line_disc = round_money(line_calc["discount"])
+                line_taxable = round_money(line_calc["taxable_amount"])
+                line_vat = round_money(line_calc["tax_amount"])
+                line_total_with_tax = round_money(line_calc["total_with_tax"])
+                line_total_cost = round_money(to_decimal(qty) * to_decimal(cost)) if (prod_obj and not prod_obj.is_service) else 0.0
 
-                subtotal += (qty * price)
-                total_discount += disc
-                taxable_amount += line_taxable
-                total_vat += line_vat
-                grand_total += line_total_with_tax
-                total_cost += line_total_cost
+                subtotal = round_money(to_decimal(subtotal) + to_decimal(line_gross))
+                total_discount = round_money(to_decimal(total_discount) + to_decimal(line_disc))
+                taxable_amount = round_money(to_decimal(taxable_amount) + to_decimal(line_taxable))
+                total_vat = round_money(to_decimal(total_vat) + to_decimal(line_vat))
+                grand_total = round_money(to_decimal(grand_total) + to_decimal(line_total_with_tax))
+                total_cost = round_money(to_decimal(total_cost) + to_decimal(line_total_cost))
 
                 calculated_items.append({
                     "product_id": prod_obj.id if prod_obj else None,
@@ -954,7 +1707,7 @@ class LedgerService:
                     "quantity": qty,
                     "unit_price": price,
                     "cost_price": cost,
-                    "discount": disc,
+                    "discount": line_disc,
                     "taxable_amount": line_taxable,
                     "tax_rate": rate,
                     "tax_amount": line_vat,
@@ -968,17 +1721,27 @@ class LedgerService:
                         )
                     inventory_updates.append((prod_obj, qty, cost, line_total_cost))
 
-            subtotal = round(subtotal, 2)
-            total_discount = round(total_discount, 2)
-            taxable_amount = round(taxable_amount, 2)
-            total_vat = round(total_vat, 2)
-            grand_total = round(taxable_amount + total_vat, 2)
-            total_cost = round(total_cost, 2)
+            subtotal = round_money(subtotal)
+            total_discount = round_money(total_discount)
+            taxable_amount = round_money(taxable_amount)
+            total_vat = round_money(total_vat)
+            grand_total = round_money(to_decimal(taxable_amount) + to_decimal(total_vat))
+            total_cost = round_money(total_cost)
 
             inv_dt = datetime.combine(invoice_date, datetime.now().time())
+            icv_seq = db.query(SalesInvoice).count() + 1
             qr_code_b64 = cls.generate_zatca_qr_code(
-                seller_name=seller_name, vat_number=seller_vat_number,
-                invoice_datetime=inv_dt, total_amount=grand_total, vat_amount=total_vat
+                seller_name=seller_name,
+                vat_number=seller_vat_number,
+                invoice_datetime=inv_dt,
+                total_amount=grand_total,
+                vat_amount=total_vat,
+                doc_number=invoice_number,
+                doc_type_code="388",
+                subtype_code="0100000" if invoice_type == InvoiceType.STANDARD else "0200000",
+                buyer_name=customer_name,
+                buyer_vat=customer_vat_number or "",
+                icv=icv_seq,
             )
 
             if payment_method == PaymentMethod.CASH:
@@ -1075,6 +1838,28 @@ class LedgerService:
                     notes=f"صرف مبيعات للعميل: {customer_name}"
                 ))
 
+            cls.record_audit_log(
+                db=db,
+                table_name="sales_invoices",
+                record_id=invoice.id,
+                action="CREATE_SALES_INVOICE",
+                performed_by=performed_by,
+                reference_number=invoice_number,
+                financial_amount=grand_total,
+                new_values={
+                    "invoice_number": invoice_number,
+                    "invoice_date": str(invoice_date),
+                    "customer_name": customer_name,
+                    "customer_vat_number": customer_vat_number or "",
+                    "invoice_type": invoice_type.value,
+                    "payment_method": payment_method.value,
+                    "taxable_amount": taxable_amount,
+                    "vat_amount": total_vat,
+                    "grand_total": grand_total,
+                },
+                details=f"Sales Invoice: {invoice_number} | Customer: {customer_name} | Total: {grand_total:,.2f} SAR (VAT: {total_vat:,.2f})",
+            )
+
             db.commit()
             db.refresh(invoice)
             return invoice
@@ -1116,6 +1901,12 @@ class LedgerService:
                 supplier_name = supp_obj.name_ar
                 supplier_vat_number = supp_obj.vat_number
 
+            if supplier_vat_number and str(supplier_vat_number).strip():
+                supp_vat_chk = ZATCAPhase2Validator.validate_saudi_vat_number(supplier_vat_number, party_role="SUPPLIER", required=True)
+                if not supp_vat_chk["is_valid"]:
+                    raise LedgerValidationError(supp_vat_chk["message_ar"])
+                supplier_vat_number = supp_vat_chk["clean_vat"]
+
             fiscal_year = invoice_date.year
             invoice_number = cls.generate_purchase_number(db, fiscal_year)
 
@@ -1143,23 +1934,26 @@ class LedgerService:
                 rate = float(item.get("tax_rate", prod_obj.tax_rate if prod_obj else settings.default_vat_rate))
                 item_name = item.get("item_name") or (prod_obj.name_ar if prod_obj else "بند مشتريات")
 
-                line_taxable = round(max(0.0, (qty * price) - disc), 2)
-                line_vat = round(line_taxable * rate, 2)
-                line_total_with_tax = round(line_taxable + line_vat, 2)
-                net_unit_cost = line_taxable / qty if qty > 0 else price
+                line_calc = calculate_line_and_tax_amounts(qty, price, disc, rate)
+                line_gross = round_money(line_calc["gross_amount"])
+                line_disc = round_money(line_calc["discount"])
+                line_taxable = round_money(line_calc["taxable_amount"])
+                line_vat = round_money(line_calc["tax_amount"])
+                line_total_with_tax = round_money(line_calc["total_with_tax"])
+                net_unit_cost = round_rate(to_decimal(line_taxable) / to_decimal(qty)) if qty > 0 else round_rate(price)
 
-                subtotal += (qty * price)
-                total_discount += disc
-                taxable_amount += line_taxable
-                total_vat += line_vat
-                grand_total += line_total_with_tax
+                subtotal = round_money(to_decimal(subtotal) + to_decimal(line_gross))
+                total_discount = round_money(to_decimal(total_discount) + to_decimal(line_disc))
+                taxable_amount = round_money(to_decimal(taxable_amount) + to_decimal(line_taxable))
+                total_vat = round_money(to_decimal(total_vat) + to_decimal(line_vat))
+                grand_total = round_money(to_decimal(grand_total) + to_decimal(line_total_with_tax))
 
                 calculated_items.append({
                     "product_id": prod_obj.id if prod_obj else None,
                     "item_name": item_name,
                     "quantity": qty,
                     "unit_price": price,
-                    "discount": disc,
+                    "discount": line_disc,
                     "taxable_amount": line_taxable,
                     "tax_rate": rate,
                     "tax_amount": line_vat,
@@ -1167,18 +1961,18 @@ class LedgerService:
                 })
 
                 if prod_obj and not prod_obj.is_service:
-                    inventory_taxable_amount += line_taxable
+                    inventory_taxable_amount = round_money(to_decimal(inventory_taxable_amount) + to_decimal(line_taxable))
                     inventory_updates.append((prod_obj, qty, net_unit_cost, line_taxable))
                 else:
-                    direct_expense_taxable_amount += line_taxable
+                    direct_expense_taxable_amount = round_money(to_decimal(direct_expense_taxable_amount) + to_decimal(line_taxable))
 
-            subtotal = round(subtotal, 2)
-            total_discount = round(total_discount, 2)
-            taxable_amount = round(taxable_amount, 2)
-            inventory_taxable_amount = round(inventory_taxable_amount, 2)
-            direct_expense_taxable_amount = round(direct_expense_taxable_amount, 2)
-            total_vat = round(total_vat, 2)
-            grand_total = round(taxable_amount + total_vat, 2)
+            subtotal = round_money(subtotal)
+            total_discount = round_money(total_discount)
+            taxable_amount = round_money(taxable_amount)
+            inventory_taxable_amount = round_money(inventory_taxable_amount)
+            direct_expense_taxable_amount = round_money(direct_expense_taxable_amount)
+            total_vat = round_money(total_vat)
+            grand_total = round_money(to_decimal(taxable_amount) + to_decimal(total_vat))
 
             if payment_method == PaymentMethod.CASH:
                 credit_acc_code = treasury_account_code or "110101"
@@ -1232,13 +2026,31 @@ class LedgerService:
                 performed_by=performed_by
             )
 
+            pur_dt = datetime.combine(invoice_date, datetime.now().time())
+            pur_icv_seq = db.query(PurchaseInvoice).count() + 1
+            qr_seller_name = (supplier_name or settings.company_name_ar).strip()
+            qr_seller_vat = (supplier_vat_number if (supplier_vat_number and len(str(supplier_vat_number).strip()) == 15) else settings.vat_number).strip()
+            pur_qr_b64 = cls.generate_zatca_qr_code(
+                seller_name=qr_seller_name,
+                vat_number=qr_seller_vat,
+                invoice_datetime=pur_dt,
+                total_amount=grand_total,
+                vat_amount=total_vat,
+                doc_number=invoice_number,
+                doc_type_code="388",
+                subtype_code="0100000",
+                buyer_name=settings.company_name_ar,
+                buyer_vat=settings.vat_number,
+                icv=pur_icv_seq,
+            )
+
             purchase_inv = PurchaseInvoice(
                 invoice_number=invoice_number, supplier_invoice_number=supplier_invoice_number,
                 invoice_date=invoice_date, supplier_id=supplier_id, supplier_name=supplier_name,
                 supplier_vat_number=supplier_vat_number, cost_center_id=cost_center_id,
                 payment_method=payment_method, subtotal=subtotal, discount_amount=total_discount,
                 taxable_amount=taxable_amount, vat_amount=total_vat, grand_total=grand_total,
-                journal_entry_id=purchase_entry.id, notes=notes
+                journal_entry_id=purchase_entry.id, qr_code_base64=pur_qr_b64, notes=notes
             )
             db.add(purchase_inv)
             db.flush()
@@ -1272,6 +2084,28 @@ class LedgerService:
                     unit_cost=round(net_unit_cost, 2), total_cost=round(total_in_cost, 2),
                     journal_entry_id=purchase_entry.id, notes=f"استلام مشتريات من المورد: {supplier_name}"
                 ))
+
+            cls.record_audit_log(
+                db=db,
+                table_name="purchase_invoices",
+                record_id=purchase_inv.id,
+                action="CREATE_PURCHASE_INVOICE",
+                performed_by=performed_by,
+                reference_number=invoice_number,
+                financial_amount=grand_total,
+                new_values={
+                    "invoice_number": invoice_number,
+                    "supplier_invoice_number": supplier_invoice_number or "",
+                    "invoice_date": str(invoice_date),
+                    "supplier_name": supplier_name,
+                    "supplier_vat_number": supplier_vat_number or "",
+                    "payment_method": payment_method.value,
+                    "taxable_amount": taxable_amount,
+                    "vat_amount": total_vat,
+                    "grand_total": grand_total,
+                },
+                details=f"Purchase Invoice: {invoice_number} | Supplier: {supplier_name} | Total: {grand_total:,.2f} SAR (VAT: {total_vat:,.2f})",
+            )
 
             db.commit()
             db.refresh(purchase_inv)
@@ -1328,6 +2162,7 @@ class LedgerService:
                     performed_by=performed_by
                 )
 
+            old_stock_qty = round(float(prod.stock_quantity), 4)
             prod.stock_quantity = round(float(new_actual_quantity), 4)
             cls._sync_warehouse_stock(db, prod, diff_qty, warehouse_id=warehouse_id)
 
@@ -1339,6 +2174,19 @@ class LedgerService:
                 journal_entry_id=je.id if je else None, notes=reason
             )
             db.add(inv_tx)
+            db.flush()
+            cls.record_audit_log(
+                db=db,
+                table_name="inventory_transactions",
+                record_id=inv_tx.id,
+                action="INVENTORY_ADJUSTMENT",
+                performed_by=performed_by,
+                reference_number=ref_no,
+                financial_amount=total_adj_cost,
+                old_values={"product_code": prod.code, "stock_quantity": old_stock_qty},
+                new_values={"product_code": prod.code, "stock_quantity": round(float(prod.stock_quantity), 4), "diff_qty": diff_qty},
+                details=f"Inventory Adjustment {ref_no} for {prod.code}: {old_stock_qty} -> {prod.stock_quantity} ({reason})",
+            )
             db.commit()
             db.refresh(inv_tx)
             return inv_tx
@@ -1383,10 +2231,24 @@ class LedgerService:
                 c_match = db.query(Customer).filter(Customer.name_ar == party_name.strip()).first()
                 if c_match:
                     customer_id = c_match.id
+                    if not party_vat_number:
+                        party_vat_number = c_match.vat_number
             elif note_type == NoteType.DEBIT_NOTE and not supplier_id and party_name:
                 s_match = db.query(Supplier).filter(Supplier.name_ar == party_name.strip()).first()
                 if s_match:
                     supplier_id = s_match.id
+                    if not party_vat_number:
+                        party_vat_number = s_match.vat_number
+
+            if party_vat_number and str(party_vat_number).strip():
+                p_chk = ZATCAPhase2Validator.validate_saudi_vat_number(
+                    party_vat_number,
+                    party_role="BUYER" if note_type == NoteType.CREDIT_NOTE else "SUPPLIER",
+                    required=True
+                )
+                if not p_chk["is_valid"]:
+                    raise LedgerValidationError(p_chk["message_ar"])
+                party_vat_number = p_chk["clean_vat"]
 
             subtotal = 0.0
             taxable_amount = 0.0
@@ -1410,16 +2272,17 @@ class LedgerService:
                 rate = float(item.get("tax_rate", prod_obj.tax_rate if prod_obj else settings.default_vat_rate))
                 item_name = item.get("item_name") or (prod_obj.name_ar if prod_obj else "بند مرتجع")
 
-                line_taxable = round(qty * price, 2)
-                line_vat = round(line_taxable * rate, 2)
-                line_total = round(line_taxable + line_vat, 2)
-                line_cost = round(qty * cost, 2) if (prod_obj and not prod_obj.is_service) else 0.0
+                line_calc = calculate_line_and_tax_amounts(qty, price, 0.0, rate)
+                line_taxable = round_money(line_calc["taxable_amount"])
+                line_vat = round_money(line_calc["tax_amount"])
+                line_total = round_money(line_calc["total_with_tax"])
+                line_cost = round_money(to_decimal(qty) * to_decimal(cost)) if (prod_obj and not prod_obj.is_service) else 0.0
 
-                subtotal += line_taxable
-                taxable_amount += line_taxable
-                total_vat += line_vat
-                grand_total += line_total
-                total_cost_rev += line_cost
+                subtotal = round_money(to_decimal(subtotal) + to_decimal(line_taxable))
+                taxable_amount = round_money(to_decimal(taxable_amount) + to_decimal(line_taxable))
+                total_vat = round_money(to_decimal(total_vat) + to_decimal(line_vat))
+                grand_total = round_money(to_decimal(grand_total) + to_decimal(line_total))
+                total_cost_rev = round_money(to_decimal(total_cost_rev) + to_decimal(line_cost))
 
                 calculated_items.append({
                     "product_id": prod_obj.id if prod_obj else None,
@@ -1431,16 +2294,26 @@ class LedgerService:
                 if prod_obj and not prod_obj.is_service:
                     inventory_updates.append((prod_obj, qty, cost, line_cost, price))
 
-            subtotal = round(subtotal, 2)
-            taxable_amount = round(taxable_amount, 2)
-            total_vat = round(total_vat, 2)
-            grand_total = round(taxable_amount + total_vat, 2)
-            total_cost_rev = round(total_cost_rev, 2)
+            subtotal = round_money(subtotal)
+            taxable_amount = round_money(taxable_amount)
+            total_vat = round_money(total_vat)
+            grand_total = round_money(to_decimal(taxable_amount) + to_decimal(total_vat))
+            total_cost_rev = round_money(total_cost_rev)
 
             note_dt = datetime.combine(note_date, datetime.now().time())
+            note_icv = db.query(CreditDebitNote).count() + 1
             qr_b64 = cls.generate_zatca_qr_code(
-                seller_name=settings.company_name_ar, vat_number=settings.vat_number,
-                invoice_datetime=note_dt, total_amount=grand_total, vat_amount=total_vat
+                seller_name=settings.company_name_ar,
+                vat_number=settings.vat_number,
+                invoice_datetime=note_dt,
+                total_amount=grand_total,
+                vat_amount=total_vat,
+                doc_number=note_number,
+                doc_type_code="381" if note_type == NoteType.CREDIT_NOTE else "383",
+                subtype_code="0100000" if party_vat_number else "0200000",
+                buyer_name=party_name,
+                buyer_vat=party_vat_number or "",
+                icv=note_icv,
             )
 
             cogs_entry = None
@@ -1587,6 +2460,27 @@ class LedgerService:
                     tax_amount=c_item["tax_amount"], total_with_tax=c_item["total_with_tax"]
                 ))
 
+            cls.record_audit_log(
+                db=db,
+                table_name="credit_debit_notes",
+                record_id=note_obj.id,
+                action="CREATE_CREDIT_NOTE" if note_type == NoteType.CREDIT_NOTE else "CREATE_DEBIT_NOTE",
+                performed_by=performed_by,
+                reference_number=note_number,
+                financial_amount=grand_total,
+                new_values={
+                    "note_number": note_number,
+                    "note_type": note_type.value,
+                    "original_invoice_number": original_invoice_number or "",
+                    "party_name": party_name,
+                    "taxable_amount": taxable_amount,
+                    "vat_amount": total_vat,
+                    "grand_total": grand_total,
+                    "reason": reason,
+                },
+                details=f"{note_type.value}: {note_number} (Orig: {original_invoice_number or '-'}) | Party: {party_name} | Total: {grand_total:,.2f} SAR",
+            )
+
             db.commit()
             db.refresh(note_obj)
             return note_obj
@@ -1714,6 +2608,25 @@ class LedgerService:
                 journal_entry_id=je.id
             )
             db.add(voucher)
+            db.flush()
+            cls.record_audit_log(
+                db=db,
+                table_name="cash_vouchers",
+                record_id=voucher.id,
+                action="CREATE_RECEIPT_VOUCHER" if voucher_type == VoucherType.RECEIPT else "CREATE_PAYMENT_VOUCHER",
+                performed_by=performed_by,
+                reference_number=voucher_number,
+                financial_amount=total_amount,
+                new_values={
+                    "voucher_number": voucher_number,
+                    "voucher_type": voucher_type.value,
+                    "party_name": party_name,
+                    "payment_method": payment_method.value,
+                    "total_amount": total_amount,
+                    "vat_amount": vat_amount,
+                },
+                details=f"Voucher {voucher_number} ({voucher_type.value}) | Party: {party_name} | Amount: {total_amount:,.2f} SAR",
+            )
             db.commit()
             db.refresh(voucher)
             return voucher
@@ -2115,6 +3028,24 @@ class LedgerService:
             net_paid_salaries=tot_net, journal_entry_id=je.id, notes=notes
         )
         db.add(pr)
+        db.flush()
+        cls.record_audit_log(
+            db=db,
+            table_name="payroll_runs",
+            record_id=pr.id,
+            action="PROCESS_PAYROLL_RUN",
+            performed_by=performed_by,
+            reference_number=payroll_no,
+            financial_amount=tot_net,
+            new_values={
+                "payroll_number": payroll_no,
+                "period_month": clean_month,
+                "employees_count": len(emps),
+                "total_gross_salaries": tot_gross,
+                "net_paid_salaries": tot_net,
+            },
+            details=f"Payroll Run {payroll_no} ({clean_month}) | Employees: {len(emps)} | Net Paid: {tot_net:,.2f} SAR",
+        )
         db.commit()
         db.refresh(pr)
         return pr
@@ -2595,6 +3526,19 @@ class LedgerService:
                                 fa.accumulated_depreciation = max(0.0, round(fa.accumulated_depreciation - line.credit, 2))
                                 fa.net_book_value = round(fa.purchase_cost - fa.accumulated_depreciation, 2)
                                 fa.last_depreciation_date = None
+
+            cls.record_audit_log(
+                db=db,
+                table_name="journal_entries",
+                record_id=original_entry.id,
+                action="REVERSE_JOURNAL_ENTRY",
+                performed_by=performed_by,
+                reference_number=original_entry.entry_number,
+                financial_amount=original_entry.total_debit,
+                old_values={"status": EntryStatus.POSTED.value, "entry_number": original_entry.entry_number},
+                new_values={"status": EntryStatus.REVERSED.value, "reversing_entry_number": rev_entry.entry_number, "reason": reason},
+                details=f"Reversed Entry {original_entry.entry_number} via {rev_entry.entry_number} (Amount: {float(original_entry.total_debit):,.2f} SAR, Reason: {reason})",
+            )
 
             db.commit()
             db.refresh(rev_entry)
@@ -3196,3 +4140,82 @@ class LedgerService:
                 row_dict[f"{wh.code} - {wh.name_ar}"] = round(qty, 2)
             rows.append(row_dict)
         return pd.DataFrame(rows)
+
+    @classmethod
+    def reconcile_subledgers_with_gl(
+        cls,
+        db: Session,
+        end_date: Optional[date] = None
+    ) -> Dict[str, Any]:
+        """
+        مراجعة ومطابقة دفاتر الأستاذ المساعدة (العملاء، الموردين، المخزون) مع حسابات الرقابة
+        في الأستاذ العام (110301، 210101، 110401) قبل الاعتماد الرسمي للتقارير.
+        """
+        tb_df = cls.get_live_trial_balance(db, start_date=None, end_date=end_date, include_zero_balances=True)
+
+        def _gl_net_balance(code: str, natural: str) -> float:
+            if tb_df.empty:
+                return 0.0
+            sub = tb_df[tb_df["Account Code"] == code]
+            if sub.empty:
+                return 0.0
+            c_deb = float(sub["Closing Debit"].sum())
+            c_crd = float(sub["Closing Credit"].sum())
+            return round_money((c_deb - c_crd) if natural == "DEBIT" else (c_crd - c_deb))
+
+        gl_ar = _gl_net_balance("110301", "DEBIT")
+        gl_ap = _gl_net_balance("210101", "CREDIT")
+        gl_inv = _gl_net_balance("110401", "DEBIT")
+
+        customers = db.query(Customer).all()
+        sub_ar = round_money(sum(
+            cls.get_party_statement(db, "CUSTOMER", c.id, end_date=end_date)["net_balance"]
+            for c in customers
+        ))
+
+        suppliers = db.query(Supplier).all()
+        sub_ap = round_money(sum(
+            cls.get_party_statement(db, "SUPPLIER", s.id, end_date=end_date)["net_balance"]
+            for s in suppliers
+        ))
+
+        if end_date is None:
+            inv_df = cls.get_inventory_valuation_df(db)
+            sub_inv = round_money(float(inv_df["إجمالي قيمة المخزون"].sum())) if not inv_df.empty else 0.0
+        else:
+            sub_inv = gl_inv
+
+        ar_diff = round_money(abs(gl_ar - sub_ar))
+        ap_diff = round_money(abs(gl_ap - sub_ap))
+        inv_diff = round_money(abs(gl_inv - sub_inv))
+
+        checks = [
+            {
+                "check_name": "مطابقة أستاذ مساعد العملاء مع حساب الرقابة (110301)",
+                "gl_balance": gl_ar,
+                "subledger_balance": sub_ar,
+                "difference": ar_diff,
+                "passed": ar_diff <= 0.05
+            },
+            {
+                "check_name": "مطابقة أستاذ مساعد الموردين مع حساب الرقابة (210101)",
+                "gl_balance": gl_ap,
+                "subledger_balance": sub_ap,
+                "difference": ap_diff,
+                "passed": ap_diff <= 0.05
+            },
+            {
+                "check_name": "مطابقة تقييم المخزون (WAC) مع حساب المخزون بالأستاذ العام (110401)",
+                "gl_balance": gl_inv,
+                "subledger_balance": sub_inv,
+                "difference": inv_diff,
+                "passed": inv_diff <= 0.50
+            },
+        ]
+        all_passed = all(c["passed"] for c in checks)
+        return {
+            "all_reconciled": all_passed,
+            "status_ar": "مطابق تماماً ✅" if all_passed else "يوجد فروق مطابقة تحتاج مراجعة ⚠️",
+            "checks": checks
+        }
+

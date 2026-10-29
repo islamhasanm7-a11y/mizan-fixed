@@ -17,17 +17,7 @@ import time
 import urllib.request
 
 
-def _ensure_dependencies_installed() -> None:
-    """Ensure required packages from requirements.txt are installed even after a fresh container cold start."""
-    if importlib.util.find_spec("streamlit") is not None and importlib.util.find_spec("openpyxl") is not None:
-        return
-    if importlib.util.find_spec("pip") is None:
-        get_pip_path = "/tmp/get-pip.py"
-        urllib.request.urlretrieve("https://bootstrap.pypa.io/get-pip.py", get_pip_path)
-        subprocess.run([sys.executable, get_pip_path], check=False)
-    req_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
-    if os.path.exists(req_file):
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", req_file], check=False)
+from setup_env import check_installed_dependencies, provision_environment
 
 
 def _run_streamlit_server_with_proxy() -> None:
@@ -40,7 +30,8 @@ def _run_streamlit_server_with_proxy() -> None:
     server_sock.bind(("0.0.0.0", port))
     server_sock.listen(128)
 
-    _ensure_dependencies_installed()
+    if check_installed_dependencies():
+        provision_environment(use_lock=True)
 
     env = os.environ.copy()
     env["_MIZAN_STREAMLIT_WORKER"] = "1"
@@ -165,11 +156,11 @@ if __name__ == "__main__" and os.environ.get("_MIZAN_STREAMLIT_WORKER") != "1":
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
-from datetime import date
+from datetime import date, datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
 
-from database import SessionLocal, BASE_DIR
+from database import SessionLocal, BASE_DIR, create_sanitized_backup_bytes
 from models import (
     Account, JournalEntry, EntryStatus, DocumentType,
     Customer, Supplier, Product, InventoryTransaction,
@@ -178,19 +169,27 @@ from models import (
     VoucherType, VoucherPartyType, CostCenter, FixedAsset,
     Employee, PayrollRun, AppUser, UserRole, TBMappingProfile, AuditLog,
     CustomRoleTemplate, Warehouse, WarehouseStock, SYSTEM_MODULES, MODULE_LABEL_TO_KEY, SYSTEM_ACTIONS,
-    ALL_PERMISSION_KEYS, get_default_permissions_for_role, verify_pin_code
+    ALL_PERMISSION_KEYS, get_default_permissions_for_role, verify_pin_code,
+    AUDIT_TRANSACTION_TYPES, classify_audit_transaction_type, get_audit_transaction_type_label, compute_audit_entry_hash
 )
 import base64
 import sqlite3
 import shutil
 import tempfile
 import json
-from seed_coa import init_database_and_seed
+from seed_coa import init_database_and_seed, get_initial_admin_bootstrap_pin
 from ledger_service import LedgerService, LedgerValidationError
-from financial_engine import FinancialStatementsEngine
+from financial_engine import FinancialStatementsEngine, ExportService
 from export_service import ExcelExportService, PrintTemplateService
 from tb_analyzer_service import ExternalTBAnalyzerService, CPA_CATEGORIES, AUDIT_OPINION_TYPES
 from google_drive_service import GoogleDriveService, SCOPES as GOOGLE_DRIVE_SCOPES
+from zatca_phase2_validator import ZATCAPhase2Validator, ZATCA_TLV_TAG_SPECS
+from zatca_qr_tlv import (
+    ZATCATLVQRGenerator,
+    decode_zatca_tlv_qr_base64,
+    format_zatca_timestamp,
+    generate_zatca_tlv_qr_base64,
+)
 
 
 # =============================================================================
@@ -284,112 +283,127 @@ st.markdown("""
 
 
 def get_db_session():
-    """الحصول على جلسة قاعدة بيانات آمنة"""
-    return SessionLocal()
+    """الحصول على جلسة قاعدة بيانات آمنة مع ربطها التلقائي بمعرف المستخدم النشط (User ID) لسجل التدقيق الرقابي"""
+    sess = SessionLocal()
+    u_info = st.session_state.get("active_user_info")
+    if isinstance(u_info, dict) and u_info.get("id"):
+        sess.info["user_id"] = f"USR-{int(u_info['id']):03d}"
+        sess.info["username"] = str(u_info.get("username") or "admin")
+        sess.info["performed_by"] = f"{u_info.get('full_name_ar', 'مدير النظام')} ({u_info.get('username', 'admin')})"
+    return sess
 
 
 # =============================================================================
-# 2. القائمة الجانبية والتنقل وإدارة المستخدمين (Sidebar Navigation)
+# 2. بوابة تسجيل الدخول الإلزامي وإدارة الجلسة الآمنة (Mandatory Auth Gate)
 # =============================================================================
-db_side = get_db_session()
+db_auth = get_db_session()
 try:
-    company_cfg = LedgerService.get_company_settings(db_side)
+    company_cfg = LedgerService.get_company_settings(db_auth)
     comp_name_display = company_cfg.company_name_ar
     comp_vat_display = company_cfg.vat_number
     comp_year_display = company_cfg.fiscal_year
-    users_list = db_side.query(AppUser).filter(AppUser.is_active == True).order_by(AppUser.id).all()
-    user_map = {}
-    for u in users_list:
-        label = f"👤 {u.full_name_ar} ({u.role.value})"
-        user_map[label] = {
-            "id": u.id,
-            "username": u.username,
-            "full_name_ar": u.full_name_ar,
-            "job_title": u.job_title or "مسؤول مالي",
-            "role": u.role.value,
-            "pin_code": u.pin_code,
-            "max_discount_pct": float(u.max_discount_pct if u.max_discount_pct is not None else 100.0),
-            "permissions": u.get_permissions(),
-            "allowed_menus": u.get_allowed_menu_options()
-        }
-    if not user_map:
-        default_admin_perms = get_default_permissions_for_role(UserRole.ADMIN)
-        user_map["👤 المدير المالي (ADMIN)"] = {
-            "id": 1,
-            "username": "admin",
-            "full_name_ar": "المدير المالي",
-            "job_title": "المدير المالي التنفيذي",
-            "role": "ADMIN",
-            "pin_code": "1234",
-            "max_discount_pct": 100.0,
-            "permissions": default_admin_perms,
-            "allowed_menus": list(SYSTEM_MODULES.values())
-        }
+
+    auth_user_id = st.session_state.get("authenticated_user_id")
+    authenticated_user = None
+    if auth_user_id:
+        authenticated_user = db_auth.query(AppUser).filter(
+            AppUser.id == int(auth_user_id),
+            AppUser.is_active == True
+        ).first()
+        if not authenticated_user:
+            st.session_state.pop("authenticated_user_id", None)
+            st.session_state.pop("active_user", None)
+            st.session_state.pop("active_user_info", None)
+
+    if not authenticated_user:
+        st.markdown(f"""
+        <div class="main-header" style="text-align:center;">
+            <h2 style="margin:0; color:white;">🔐 بوابة الدخول الآمن الإلزامي - {comp_name_display}</h2>
+            <p style="margin:6px 0 0 0; color:#CBD5E1; font-size:14px;">نظام MizanPro ERP & CPA محمي بالكامل — يرجى تسجيل الدخول باسم المستخدم ورمز الدخول السري (PIN)</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        bootstrap_pin = get_initial_admin_bootstrap_pin()
+        admin_obj = db_auth.query(AppUser).filter(AppUser.username == "admin").first()
+        if bootstrap_pin and admin_obj and admin_obj.must_change_pin:
+            st.warning(
+                f"🛡️ **تنبيه أمني لإعداد النظام لأول مرة (أو بعد تدوير الرموز المكشوفة):**\n\n"
+                f"- اسم مستخدم المدير: `admin`\n"
+                f"- رمز الدخول العشوائي المؤقت لمرة واحدة: **`{bootstrap_pin}`**\n\n"
+                f"*سيُطلب منك إلزامياً تغيير هذا الرمز فور تسجيل الدخول الأول، وسيتم مسح هذا الإشعار نهائياً.*"
+            )
+
+        _, login_col, _ = st.columns([1, 1.4, 1])
+        with login_col:
+            with st.form("mandatory_login_form", clear_on_submit=False):
+                st.markdown("#### **🔑 تسجيل الدخول للنظام المالي**")
+                in_login_user = st.text_input("اسم المستخدم (Username):", placeholder="أدخل اسم المستخدم الخاص بك")
+                in_login_pin = st.text_input("رمز الدخول السري (PIN):", type="password", placeholder="أدخل رمز الـ PIN السري")
+                submit_login = st.form_submit_button("🔐 تسجيل الدخول الآمن", type="primary", use_container_width=True)
+
+                if submit_login:
+                    try:
+                        logged_u = LedgerService.authenticate_user(db_auth, in_login_user, in_login_pin)
+                        st.session_state["authenticated_user_id"] = logged_u.id
+                        st.success(f"✅ مرحباً بك ({logged_u.full_name_ar})!")
+                        st.rerun()
+                    except Exception as ex_auth:
+                        st.error(f"❌ {ex_auth}")
+        st.stop()
+
+    # فرض تغيير رمز الدخول السري عند أول دخول (أو بعد تدوير الرموز) قبل السماح بأي شاشة
+    if authenticated_user.must_change_pin:
+        st.markdown(f"""
+        <div class="main-header" style="text-align:center; background: linear-gradient(135deg, #991B1B 0%, #450A0A 100%);">
+            <h2 style="margin:0; color:white;">🔒 تغيير رمز الدخول السري الإلزامي عند أول دخول</h2>
+            <p style="margin:6px 0 0 0; color:#FECACA; font-size:14px;">مرحباً ({authenticated_user.full_name_ar}) — لحماية البيانات المالية، يجب تعيين رمز سري جديد خاص بك قبل استخدام النظام</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        _, chg_col, _ = st.columns([1, 1.4, 1])
+        with chg_col:
+            with st.form("mandatory_first_pin_change_form"):
+                st.markdown("#### **🔑 تعيين رمز دخول سري جديد (6 أرقام قوية)**")
+                curr_pin_in = st.text_input("رمز الدخول الحالي (المؤقت):", type="password")
+                new_pin_in = st.text_input("رمز الدخول السري الجديد (6 أرقام غير متكررة):", type="password")
+                conf_pin_in = st.text_input("تأكيد رمز الدخول السري الجديد:", type="password")
+                sub_chg = st.form_submit_button("💾 حفظ الرمز السري الجديد وتفعيل الحساب", type="primary", use_container_width=True)
+
+                if sub_chg:
+                    if new_pin_in != conf_pin_in:
+                        st.error("❌ رمز الدخول الجديد وتأكيده غير متطابقين.")
+                    else:
+                        try:
+                            LedgerService.change_user_pin(
+                                db=db_auth,
+                                user_id=authenticated_user.id,
+                                current_pin=curr_pin_in,
+                                new_pin=new_pin_in,
+                                performed_by=authenticated_user.full_name_ar
+                            )
+                            st.success("✅ تم تحديث رمز الدخول السري بنجاح وتفعيل حسابك!")
+                            st.rerun()
+                        except Exception as ex_pin:
+                            st.error(f"❌ {ex_pin}")
+            if st.button("🚪 تسجيل الخروج", use_container_width=True):
+                st.session_state.pop("authenticated_user_id", None)
+                st.rerun()
+        st.stop()
+
+    active_user_info = {
+        "id": authenticated_user.id,
+        "username": authenticated_user.username,
+        "full_name_ar": authenticated_user.full_name_ar,
+        "job_title": authenticated_user.job_title or "مسؤول مالي",
+        "role": authenticated_user.role.value,
+        "max_discount_pct": float(authenticated_user.max_discount_pct if authenticated_user.max_discount_pct is not None else 100.0),
+        "permissions": authenticated_user.get_permissions(),
+        "allowed_menus": authenticated_user.get_allowed_menu_options() or [SYSTEM_MODULES["mod_dashboard"]],
+    }
+    st.session_state["active_user"] = active_user_info["full_name_ar"]
+    st.session_state["active_user_info"] = active_user_info
 finally:
-    db_side.close()
-
-with st.sidebar:
-    st.markdown("### ⚖️ **MizanPro ERP & CPA**")
-    st.caption(f"**{comp_name_display}**")
-    st.caption(f"الرقم الضريبي: `{comp_vat_display}`")
-
-    selected_user_label = st.selectbox("المستخدم النشط:", list(user_map.keys()))
-    active_user_info = user_map[selected_user_label]
-
-    enforce_pin = st.checkbox("🔐 طلب رمز الدخول السري (PIN) للمستخدم", value=False)
-    pin_verified = True
-    if enforce_pin:
-        entered_pin = st.text_input("أدخل رمز الدخول السري (PIN):", type="password", key=f"pin_in_{active_user_info['username']}")
-        if not verify_pin_code(entered_pin, active_user_info["pin_code"]):
-            pin_verified = False
-            st.warning("🔒 يرجى إدخال رمز الـ PIN الصحيح لتفعيل صلاحيات هذا الحساب.")
-
-    if pin_verified:
-        st.session_state["active_user"] = active_user_info["full_name_ar"]
-        st.session_state["active_user_info"] = active_user_info
-    else:
-        guest_perms = {k: False for k in ALL_PERMISSION_KEYS}
-        guest_perms["mod_dashboard"] = True
-        st.session_state["active_user"] = f"{active_user_info['full_name_ar']} (مقفل 🔒)"
-        st.session_state["active_user_info"] = {
-            **active_user_info,
-            "permissions": guest_perms,
-            "allowed_menus": [SYSTEM_MODULES["mod_dashboard"]],
-            "max_discount_pct": 0.0
-        }
-
-    curr_u = st.session_state["active_user_info"]
-    enabled_mods_cnt = sum(1 for k in SYSTEM_MODULES if curr_u["permissions"].get(k, False))
-    enabled_acts_cnt = sum(1 for k in SYSTEM_ACTIONS if curr_u["permissions"].get(k, False))
-    st.caption(
-        f"💼 **{curr_u['job_title']}** | الصلاحيات: `{enabled_mods_cnt}/{len(SYSTEM_MODULES)}` شاشة و `{enabled_acts_cnt}/{len(SYSTEM_ACTIONS)}` عملية | سقف الخصم: `{curr_u['max_discount_pct']:.0f}%`"
-    )
-
-    st.divider()
-
-    allowed_menu_list = curr_u["allowed_menus"]
-    menu_option = st.radio(
-        "الوحدات والقوائم المتاحة حسب صلاحياتك:",
-        allowed_menu_list,
-        index=0
-    )
-
-    st.divider()
-    show_global_gdrive = st.checkbox("☁️ فتح مركز Google Drive السحابي في أعلى الشاشة", value=False, key="chk_global_gdrive")
-    if curr_u["permissions"].get("act_export_reports", False):
-        db_file_path = os.path.join(BASE_DIR, "mizanpro_ledger.db")
-        if os.path.exists(db_file_path):
-            with open(db_file_path, "rb") as f_db:
-                st.download_button(
-                    label="💾 نسخ احتياطي فوري لقاعدة البيانات (.db)",
-                    data=f_db.read(),
-                    file_name=f"mizanpro_backup_{date.today()}.db",
-                    mime="application/octet-stream",
-                    use_container_width=True
-                )
-    else:
-        st.caption("🔒 النسخ الاحتياطي وتصدير الحزم مقيد حسب صلاحياتك.")
-    st.caption(f"السنة المالية: `{comp_year_display}` | IFRS / SOCPA / ZATCA")
+    db_auth.close()
 
 
 def has_perm(perm_key: str) -> bool:
@@ -402,13 +416,82 @@ def get_active_user_label() -> str:
     return st.session_state.get("active_user", "مدير النظام (Admin)")
 
 
+with st.sidebar:
+    st.markdown("### ⚖️ **MizanPro ERP & CPA**")
+    st.caption(f"**{comp_name_display}**")
+    st.caption(f"الرقم الضريبي: `{comp_vat_display}`")
+
+    curr_u = st.session_state["active_user_info"]
+    st.success(f"👤 **{curr_u['full_name_ar']}** (`{curr_u['username']}`)")
+    enabled_mods_cnt = sum(1 for k in SYSTEM_MODULES if curr_u["permissions"].get(k, False))
+    enabled_acts_cnt = sum(1 for k in SYSTEM_ACTIONS if curr_u["permissions"].get(k, False))
+    st.caption(
+        f"💼 **{curr_u['job_title']}** | الصلاحيات: `{enabled_mods_cnt}/{len(SYSTEM_MODULES)}` شاشة و `{enabled_acts_cnt}/{len(SYSTEM_ACTIONS)}` عملية | سقف الخصم: `{curr_u['max_discount_pct']:.0f}%`"
+    )
+
+    sb_c1, sb_c2 = st.columns(2)
+    with sb_c1:
+        if st.button("🚪 خروج آمن", use_container_width=True):
+            st.session_state.pop("authenticated_user_id", None)
+            st.session_state.pop("active_user", None)
+            st.session_state.pop("active_user_info", None)
+            st.rerun()
+    with sb_c2:
+        with st.popover("🔑 تغيير PIN"):
+            old_p = st.text_input("الرمز الحالي:", type="password", key="sb_old_pin")
+            new_p = st.text_input("الرمز الجديد (6 أرقام):", type="password", key="sb_new_pin")
+            if st.button("تحديث الرمز", type="primary", use_container_width=True):
+                _db_p = get_db_session()
+                try:
+                    LedgerService.change_user_pin(_db_p, curr_u["id"], old_p, new_p, performed_by=curr_u["full_name_ar"])
+                    st.success("✅ تم تغيير الرمز!")
+                except Exception as e_p:
+                    st.error(f"❌ {e_p}")
+                finally:
+                    _db_p.close()
+
+    st.divider()
+
+    allowed_menu_list = curr_u["allowed_menus"]
+    menu_option = st.radio(
+        "الوحدات والقوائم المتاحة حسب صلاحياتك:",
+        allowed_menu_list,
+        index=0
+    )
+
+    st.divider()
+    can_cloud_backup = has_perm("act_cloud_backup")
+    if can_cloud_backup:
+        show_global_gdrive = st.checkbox("☁️ فتح مركز Google Drive السحابي في أعلى الشاشة", value=False, key="chk_global_gdrive")
+        try:
+            sanitized_db_bytes = create_sanitized_backup_bytes()
+            if sanitized_db_bytes:
+                st.download_button(
+                    label="💾 نسخ احتياطي آمن لقاعدة البيانات (.db - مطهر من الرموز)",
+                    data=sanitized_db_bytes,
+                    file_name=f"mizanpro_sanitized_backup_{date.today()}.db",
+                    mime="application/octet-stream",
+                    use_container_width=True
+                )
+        except Exception:
+            pass
+    else:
+        show_global_gdrive = False
+        st.caption("🔒 مركز Google Drive والنسخ الاحتياطي لقاعدة البيانات مقيد بصلاحية (`act_cloud_backup`).")
+    st.caption(f"السنة المالية: `{comp_year_display}` | IFRS / SOCPA / ZATCA")
+
+
 def render_google_drive_hub_section(
     db,
     cpa_word_bytes: bytes = b"",
     cpa_word_filename: str = "CPA_Audited_Financial_Statements_2026.doc",
     height: int = 540
 ) -> None:
-    """تجهيز الحزم المالية المشفرة (Base64) وعرض واجهة التكامل السحابي مع Google Drive"""
+    """تجهيز الحزم المالية المشفرة (Base64) وعرض واجهة التكامل السحابي مع Google Drive للمخولين فقط"""
+    if not has_perm("act_cloud_backup"):
+        st.info("🔒 الوصول لمركز Google Drive السحابي ومزامنة النسخ الاحتياطية يتطلب صلاحية مستقلة (`act_cloud_backup`).")
+        return
+
     try:
         cfg_gd = LedgerService.get_company_settings(db)
         excel_io = ExcelExportService.generate_master_excel_report(db, fiscal_year=cfg_gd.fiscal_year)
@@ -430,13 +513,12 @@ def render_google_drive_hub_section(
     word_b64 = base64.b64encode(cpa_word_bytes).decode("utf-8") if cpa_word_bytes else ""
 
     db_b64 = ""
-    db_file_p = os.path.join(BASE_DIR, "mizanpro_ledger.db")
-    if os.path.exists(db_file_p):
-        try:
-            with open(db_file_p, "rb") as f_db_gd:
-                db_b64 = base64.b64encode(f_db_gd.read()).decode("utf-8")
-        except Exception:
-            db_b64 = ""
+    try:
+        clean_db_bytes = create_sanitized_backup_bytes()
+        if clean_db_bytes:
+            db_b64 = base64.b64encode(clean_db_bytes).decode("utf-8")
+    except Exception:
+        db_b64 = ""
 
     gdrive_html = GoogleDriveService.render_google_drive_workspace_html(
         excel_report_b64=excel_b64,
@@ -444,7 +526,7 @@ def render_google_drive_hub_section(
         cpa_word_b64=word_b64,
         cpa_word_filename=cpa_word_filename,
         db_backup_b64=db_b64,
-        db_backup_filename=f"MizanPro_Backup_{date.today()}.db"
+        db_backup_filename=f"MizanPro_Sanitized_Backup_{date.today()}.db"
     )
     components.html(gdrive_html, height=height, scrolling=True)
 
@@ -455,6 +537,451 @@ if show_global_gdrive and menu_option != "📊 لوحة التحكم والمؤ�
         render_google_drive_hub_section(_db_gd, height=520)
     finally:
         _db_gd.close()
+
+
+def render_readonly_zatca_audit_log_module(db, key_prefix: str = "zatca_audit") -> None:
+    """
+    واجهة سجل الرقابة والتدقيق الإلزامي للقراءة فقط (Read-Only ZATCA Audit Log UI Module)
+    تتيح للمستخدمين المخولين فقط (مدير النظام، المراجع القانوني CPA، أو حاملي صلاحية act_view_audit_logs)
+    فلترة واستعراض سجلات التدقيق حسب نطاق التاريخ (Date Range)، المستخدم (User)، أو نوع المعاملة (Transaction Type)
+    مع التحقق التشفيري الكامل (SHA-256 Chain) ومقارنة القيم قبل وبعد التعديل (Before/After State Diff) بدون أي إمكانية للتعديل أو الحذف.
+    """
+    u_info = st.session_state.get("active_user_info", {})
+    is_authorized = (
+        has_perm("act_view_audit_logs")
+        or has_perm("mod_audit_log")
+        or LedgerService.is_user_authorized_for_audit_logs(db, u_info)
+    )
+    if not is_authorized:
+        st.error(
+            "🔒 **وصول مقيد (ZATCA Audit Access Control):** عذراً، وحدة سجل التدقيق الرقابي للقراءة فقط متاحة حصرياً "
+            "للمستخدمين المخولين (مدير النظام `ADMIN`، المراجع القانوني `AUDITOR`، أو حاملي صلاحية `act_view_audit_logs`)."
+        )
+        return
+
+    st.markdown("""
+    <div style="background: linear-gradient(135deg, #0F172A 0%, #1E293B 100%); color: white; padding: 18px 22px; border-radius: 12px; border-right: 6px solid #10B981; margin-bottom: 16px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+            <div>
+                <h4 style="margin:0; color:#F8FAFC;">🛡️ وحدة سجل الرقابة والتدقيق الإلزامي للقراءة فقط (ZATCA Read-Only Audit Trail Module)</h4>
+                <p style="margin:5px 0 0 0; color:#CBD5E1; font-size:13px;">
+                    سجل رقابي غير قابل للتعديل أو الحذف (Append-Only / Immutable) يوثق كافة المعاملات المالية والتعديلات مع الطابع الزمني العالمي (UTC Timestamp) ومعرف المستخدم (User ID) وسلسلة التشفير المترابطة (SHA-256 Hash Chain).
+                </p>
+            </div>
+            <div style="background:#065F46; color:#D1FAE5; padding:6px 14px; border-radius:20px; font-size:12px; font-weight:700; border:1px solid #34D399;">
+                🔒 وضع القراءة فقط مفعل (Read-Only Enforced)
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    integrity_rep = LedgerService.verify_audit_log_integrity(db)
+    am1, am2, am3, am4 = st.columns(4)
+    am1.metric("إجمالي السجلات الرقابية بالقاعدة", f"{integrity_rep['total_records']}")
+    am2.metric(
+        "حالة الحماية للقراءة فقط (Read-Only)",
+        "مفعل (SQLite Triggers + ORM) 🔒" if integrity_rep["is_read_only_enforced"] else "غير مفعل ⚠️"
+    )
+    am3.metric(
+        "سلامة سلسلة التشفير (SHA-256 Chain)",
+        "سليمة 100% ✅" if integrity_rep["is_intact"] else f"خلل ({len(integrity_rep['broken_chain_links'])}) ❌"
+    )
+    am4.metric(
+        "اكتمال الهوية والطابع الزمني",
+        "مكتمل 100% ✅" if (integrity_rep["missing_user_ids"] + integrity_rep["missing_timestamps"]) == 0
+        else f"نواقص ({integrity_rep['missing_user_ids'] + integrity_rep['missing_timestamps']}) ⚠️"
+    )
+
+    st.info(
+        f"🔐 **حالة الامتثال الرقابي لهيئة الزكاة والضريبة والجمارك (ZATCA):** {integrity_rep['status_ar']}  \n"
+        f"🔗 **آخر بصمة تشفيرية للسجل (`Latest SHA-256 Chain Hash`):** `{integrity_rep['latest_chain_hash']}`"
+    )
+
+    # استعلام مبدئي لجلب قوائم الفلترة المتاحة ونطاق التواريخ في قاعدة البيانات
+    base_meta = LedgerService.query_audit_logs(db=db, requesting_user=u_info, limit=1000)
+    f_opts = base_meta["filter_options"]
+    min_db_d: date = f_opts["min_date"]
+    max_db_d: date = max(f_opts["max_date"], date.today())
+
+    st.markdown("##### **🔎 محرك الفلترة الرقابية المتقدم (حسب نطاق التاريخ، المستخدم، ونوع المعاملة المالية):**")
+    with st.container(border=True):
+        r1_c1, r1_c2, r1_c3, r1_c4 = st.columns([1.15, 1.0, 1.0, 1.35])
+        with r1_c1:
+            date_preset = st.selectbox(
+                "📅 النطاق الزمني السريع:",
+                [
+                    "الكل (جميع التواريخ المسجلة)",
+                    "تخصيص نطاق تاريخ محدد (من - إلى)",
+                    "اليوم فقط",
+                    "آخر 7 أيام",
+                    "آخر 30 يوماً",
+                    "الشهر الحالي",
+                    "السنة الحالية",
+                ],
+                index=0,
+                key=f"{key_prefix}_date_preset",
+            )
+
+        today_d = date.today()
+        if date_preset == "اليوم فقط":
+            default_start, default_end = today_d, today_d
+        elif date_preset == "آخر 7 أيام":
+            default_start, default_end = today_d - timedelta(days=7), today_d
+        elif date_preset == "آخر 30 يوماً":
+            default_start, default_end = today_d - timedelta(days=30), today_d
+        elif date_preset == "الشهر الحالي":
+            default_start, default_end = date(today_d.year, today_d.month, 1), today_d
+        elif date_preset == "السنة الحالية":
+            default_start, default_end = date(today_d.year, 1, 1), date(today_d.year, 12, 31)
+        else:
+            default_start, default_end = min_db_d, max_db_d
+
+        with r1_c2:
+            sel_start_date = st.date_input(
+                "من تاريخ (Start Date):",
+                value=default_start,
+                key=f"{key_prefix}_start_date",
+                disabled=(date_preset == "الكل (جميع التواريخ المسجلة)"),
+            )
+        with r1_c3:
+            sel_end_date = st.date_input(
+                "إلى تاريخ (End Date):",
+                value=default_end,
+                key=f"{key_prefix}_end_date",
+                disabled=(date_preset == "الكل (جميع التواريخ المسجلة)"),
+            )
+
+        tx_type_map: Dict[str, str] = f_opts["transaction_types"]
+        tx_labels_list = list(tx_type_map.values())
+        tx_label_to_key = {v: k for k, v in tx_type_map.items()}
+        with r1_c4:
+            sel_tx_label = st.selectbox(
+                "📂 فلترة حسب نوع المعاملة المالية (Transaction Type):",
+                tx_labels_list,
+                index=0,
+                key=f"{key_prefix}_tx_type",
+            )
+            sel_tx_key = tx_label_to_key.get(sel_tx_label, "ALL")
+
+        r2_c1, r2_c2, r2_c3, r2_c4 = st.columns([1.2, 1.1, 1.1, 1.4])
+        with r2_c1:
+            sel_user_filter = st.selectbox(
+                "👤 فلترة حسب المستخدم (User ID / Username):",
+                f_opts["users"],
+                index=0,
+                key=f"{key_prefix}_user_filter",
+            )
+        with r2_c2:
+            sel_table_filter = st.selectbox(
+                "🗃️ فلترة حسب الجدول المالي (Table):",
+                f_opts["tables"],
+                index=0,
+                key=f"{key_prefix}_table_filter",
+            )
+        with r2_c3:
+            sel_action_filter = st.selectbox(
+                "⚡ فلترة حسب رمز الإجراء (Action):",
+                f_opts["actions"],
+                index=0,
+                key=f"{key_prefix}_action_filter",
+            )
+        with r2_c4:
+            audit_search_q = st.text_input(
+                "🔍 بحث برقم المستند أو البصمة أو التفاصيل:",
+                placeholder="مثال: INV-2026 أو JV-2026 أو USR-001 أو SHA-256",
+                key=f"{key_prefix}_search_q",
+            )
+
+        r3_c1, r3_c2, _ = st.columns([1.2, 1.5, 2.0])
+        with r3_c1:
+            min_fin_amt = st.number_input(
+                "💰 الحد الأدنى للمبلغ المالي (ريال):",
+                min_value=0.0,
+                value=0.0,
+                step=100.0,
+                key=f"{key_prefix}_min_amt",
+            )
+        with r3_c2:
+            st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+            only_mods_flag = st.checkbox(
+                "🔄 عرض عمليات التعديل وعكس القيود فقط (Modifications & Reversals Only)",
+                value=False,
+                key=f"{key_prefix}_only_mods",
+            )
+
+    effective_start = None if date_preset == "الكل (جميع التواريخ المسجلة)" else sel_start_date
+    effective_end = None if date_preset == "الكل (جميع التواريخ المسجلة)" else sel_end_date
+
+    if effective_start and effective_end and effective_start > effective_end:
+        st.warning("⚠️ تاريخ البداية أكبر من تاريخ النهاية؛ تم تبديل التواريخ تلقائياً لعرض النطاق الصحيح.")
+        effective_start, effective_end = effective_end, effective_start
+
+    query_res = LedgerService.query_audit_logs(
+        db=db,
+        start_date=effective_start,
+        end_date=effective_end,
+        user_filter=sel_user_filter,
+        transaction_type=sel_tx_key,
+        table_name=sel_table_filter,
+        action=sel_action_filter,
+        search_query=audit_search_q,
+        min_amount=min_fin_amt,
+        only_modifications=only_mods_flag,
+        requesting_user=u_info,
+        limit=1000,
+    )
+
+    q_summary = query_res["summary"]
+    audit_df: pd.DataFrame = query_res["dataframe"]
+    matched_records = query_res["records"]
+
+    # بطاقات ملخص نتائج الفلترة
+    km1, km2, km3, km4 = st.columns(4)
+    km1.metric("عدد السجلات المطابقة للفلترة", f"{q_summary['total_matched']} / {q_summary['total_in_database']}")
+    km2.metric("إجمالي القيمة المالية للسجلات المفلترة", f"{q_summary['total_financial_volume']:,.2f} ريال")
+    km3.metric("عمليات التعديل وعكس القيود المرصودة", f"{q_summary['modifications_count']}")
+    km4.metric("عدد المستخدمين الفاعلين في النطاق", f"{q_summary['unique_users_count']}")
+
+    period_caption = (
+        f"من `{effective_start}` إلى `{effective_end}`"
+        if (effective_start and effective_end)
+        else "جميع التواريخ المسجلة"
+    )
+    st.caption(
+        f"📌 **معايير الفلترة المطبقة (Read-Only View):** النطاق الزمني: {period_caption} | "
+        f"نوع المعاملة: `{sel_tx_label}` | المستخدم: `{sel_user_filter}` | الجدول: `{sel_table_filter}` | الإجراء: `{sel_action_filter}`"
+    )
+
+    if audit_df.empty:
+        st.warning("لا توجد سجلات تدقيق مطابقة لمعايير الفلترة المحددة حالياً.")
+        return
+
+    # جدول السجلات الرقابية للقراءة فقط
+    st.dataframe(audit_df, use_container_width=True, hide_index=True)
+
+    # إعداد وتصدير تقرير PDF المؤمّن وغير القابل للتعديل لمراجعة المدقق الخارجي ومفتشي ZATCA
+    st.markdown("##### **📄 تصدير وتوثيق سجل التدقيق الرقابي للمراجع الخارجي (Immutable PDF, Signed JSON & CSV):**")
+    auditor_notes_in = st.text_input(
+        "📝 ملاحظات أو توصيات المراجع القانوني الخارجي لتضمينها وختمها داخل وثيقة الـ PDF (اختياري):",
+        value="تم فحص ومطابقة سجل التدقيق الرقابي للقراءة فقط والتحقق من سلامة سلسلة التجزئة التشفيرية SHA-256 وفق متطلبات ZATCA.",
+        key=f"{key_prefix}_auditor_pdf_notes",
+    )
+
+    immutable_pdf_bytes = LedgerService.export_immutable_audit_pdf(
+        db=db,
+        start_date=effective_start,
+        end_date=effective_end,
+        user_filter=sel_user_filter,
+        transaction_type=sel_tx_key,
+        table_name=sel_table_filter,
+        action=sel_action_filter,
+        search_query=audit_search_q,
+        min_amount=min_fin_amt,
+        only_modifications=only_mods_flag,
+        requesting_user=u_info,
+        auditor_notes=auditor_notes_in,
+        limit=1000,
+    )
+    pdf_verification_info = LedgerService.verify_immutable_audit_pdf(immutable_pdf_bytes)
+
+    dl_col1, dl_col2, dl_col3 = st.columns([1.6, 1.3, 1.3])
+    with dl_col1:
+        st.download_button(
+            "📄 تصدير تقرير التدقيق بصيغة PDF غير قابلة للتعديل (Immutable Auditor PDF)",
+            data=immutable_pdf_bytes,
+            file_name=f"ZATCA_Immutable_Audit_Log_{pdf_verification_info.get('document_id', date.today())}.pdf",
+            mime="application/pdf",
+            type="primary",
+            use_container_width=True,
+            key=f"{key_prefix}_dl_immutable_pdf",
+        )
+    with dl_col2:
+        csv_audit_bytes = audit_df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "📥 تصدير السجل المفلتر (ZATCA Audit CSV)",
+            data=csv_audit_bytes,
+            file_name=f"ZATCA_ReadOnly_Audit_Log_{date.today()}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key=f"{key_prefix}_dl_csv",
+        )
+    with dl_col3:
+        json_export_payload = {
+            "report_title": "ZATCA Read-Only Cryptographic Audit Trail Export",
+            "generated_at_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "integrity_verification": {
+                "is_intact": integrity_rep["is_intact"],
+                "is_read_only_enforced": integrity_rep["is_read_only_enforced"],
+                "latest_chain_hash": integrity_rep["latest_chain_hash"],
+            },
+            "pdf_document_seal": {
+                "document_id": pdf_verification_info.get("document_id"),
+                "core_pdf_sha256": pdf_verification_info.get("core_pdf_sha256"),
+                "manifest_seal_sha256": pdf_verification_info.get("manifest_seal_sha256"),
+                "records_digest_sha256": pdf_verification_info.get("records_digest_sha256"),
+            },
+            "summary": q_summary,
+            "records": matched_records,
+        }
+        json_audit_bytes = json.dumps(json_export_payload, ensure_ascii=False, indent=2).encode("utf-8")
+        st.download_button(
+            "🔐 تصدير الحزمة التشفيرية (Signed Audit JSON)",
+            data=json_audit_bytes,
+            file_name=f"ZATCA_Cryptographic_Audit_Trail_{date.today()}.json",
+            mime="application/json",
+            use_container_width=True,
+            key=f"{key_prefix}_dl_json",
+        )
+
+    st.success(
+        f"🔒 **بيانات الختم التشفيري لوثيقة PDF المولّدة (`{pdf_verification_info.get('document_id')}`):**  \n"
+        f"- **حالة القفل وعدم القابلية للتعديل:** `{pdf_verification_info.get('permissions_mode')}` — {pdf_verification_info.get('status_ar')}  \n"
+        f"- **بصمة صفحات الـ PDF (`Core PDF SHA-256`):** `{pdf_verification_info.get('core_pdf_sha256')}`  \n"
+        f"- **الختم التشفيري للوثيقة (`Manifest Seal SHA-256`):** `{pdf_verification_info.get('manifest_seal_sha256')}`"
+    )
+
+    with st.expander("🖨️ **معاينة النسخة الرسمية القابلة للطباعة والاعتماد للمراجع القانوني الخارجي (Printable External Auditor Report)**", expanded=False):
+        printable_audit_html = PrintTemplateService.generate_audit_log_printable_html(
+            db=db,
+            start_date=effective_start,
+            end_date=effective_end,
+            user_filter=sel_user_filter,
+            transaction_type=sel_tx_key,
+            table_name=sel_table_filter,
+            action=sel_action_filter,
+            search_query=audit_search_q,
+            min_amount=min_fin_amt,
+            only_modifications=only_mods_flag,
+            requesting_user=u_info,
+            auditor_notes=auditor_notes_in,
+            limit=250,
+        )
+        components.html(printable_audit_html, height=580, scrolling=True)
+
+    with st.expander("🛡️ **أداة المراجع الخارجي للتحقق الجنائي من سلامة وعدم التلاعب بملف PDF المصدّر (External Auditor PDF Seal Verifier)**", expanded=False):
+        st.caption(
+            "يمكن للمراجع القانوني الخارجي (CPA) أو فاحص هيئة الزكاة والضريبة والجمارك (ZATCA) رفع أي ملف PDF مصدّر مسبقاً "
+            "للتحقق فوراً من عدم تعرض أي بايت في صفحاته أو سجلاته لأي تعديل بعد إصداره."
+        )
+        up_pdf_file = st.file_uploader(
+            "ارفع ملف تقرير التدقيق المصدّر (.pdf) لفحص ختمه التشفيري (أو اتركه فارغاً لفحص الوثيقة الحالية):",
+            type=["pdf"],
+            key=f"{key_prefix}_verify_pdf_upload",
+        )
+        target_verify_bytes = up_pdf_file.read() if up_pdf_file is not None else immutable_pdf_bytes
+        v_res = LedgerService.verify_immutable_audit_pdf(target_verify_bytes)
+        if v_res.get("is_tamper_free"):
+            st.success(f"✅ **{v_res.get('status_ar')}**")
+        else:
+            st.error(f"❌ **{v_res.get('status_ar')}**")
+
+        vc1, vc2, vc3 = st.columns(3)
+        vc1.markdown(f"**معرف الوثيقة:** `{v_res.get('document_id', '-')}`")
+        vc2.markdown(f"**الرقم الضريبي للمنشأة:** `{v_res.get('company_vat', '-')}`")
+        vc3.markdown(f"**عدد السجلات الموثقة بالملف:** `{v_res.get('total_records_exported', 0)}` سجل")
+        st.code(
+            json.dumps(
+                {
+                    "document_id": v_res.get("document_id"),
+                    "is_valid_pdf": v_res.get("is_valid_pdf"),
+                    "is_immutable_sealed": v_res.get("is_immutable_sealed"),
+                    "is_tamper_free": v_res.get("is_tamper_free"),
+                    "permissions_mode": v_res.get("permissions_mode"),
+                    "exported_at_utc": v_res.get("exported_at_utc"),
+                    "exported_by": v_res.get("exported_by"),
+                    "records_digest_sha256": v_res.get("records_digest_sha256"),
+                    "core_pdf_sha256": v_res.get("core_pdf_sha256"),
+                    "manifest_seal_sha256": v_res.get("manifest_seal_sha256"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            language="json",
+        )
+
+    # ملخصات تحليلية حسب نوع المعاملة وحسب المستخدم
+    with st.expander("📊 **التحليل الإحصائي للسجلات المفلترة حسب نوع المعاملة المالية وحسب المستخدم (Transparency Breakdown)**", expanded=False):
+        b_col1, b_col2 = st.columns(2)
+        with b_col1:
+            st.markdown("###### **📂 توزيع العمليات حسب نوع المعاملة المالية:**")
+            tx_summary_rows = [
+                {
+                    "نوع المعاملة المالية": item["transaction_type_ar"],
+                    "عدد السجلات": item["count"],
+                    "إجمالي المبالغ (ريال)": f"{item['amount']:,.2f}",
+                }
+                for item in q_summary["by_transaction_type"]
+            ]
+            if tx_summary_rows:
+                st.dataframe(pd.DataFrame(tx_summary_rows), use_container_width=True, hide_index=True)
+        with b_col2:
+            st.markdown("###### **👤 توزيع العمليات حسب المستخدم المسؤول (User Accountability):**")
+            u_summary_rows = [
+                {
+                    "معرف المستخدم": item["user_id"],
+                    "اسم الدخول": item["username"],
+                    "الاسم الكامل": item["performed_by"],
+                    "عدد العمليات": item["count"],
+                    "إجمالي المبالغ (ريال)": f"{item['amount']:,.2f}",
+                }
+                for item in q_summary["by_user"]
+            ]
+            if u_summary_rows:
+                st.dataframe(pd.DataFrame(u_summary_rows), use_container_width=True, hide_index=True)
+
+    # الفاحص الجنائي التفصيلي للسجل ولقطة القيم قبل وبعد التعديل
+    with st.expander("🔍 **الفاحص الجنائي للسجل: مقارنة القيم قبل وبعد التعديل (Before / After Snapshot) والتحقق من بصمة SHA-256**", expanded=True):
+        rec_opts = {
+            f"#{r['id']} | [{r['timestamp_utc']}] {r['user_id']} ({r['username']}) — {r['action']} | {r['transaction_type_ar']} ({r['reference_number']})": r
+            for r in matched_records[:150]
+        }
+        if rec_opts:
+            sel_rec_label = st.selectbox(
+                "اختر سجل تدقيق لاستعراض تفاصيله الكاملة ولقطة البيانات:",
+                list(rec_opts.keys()),
+                key=f"{key_prefix}_inspect_rec",
+            )
+            sel_rec = rec_opts[sel_rec_label]
+
+            ic1, ic2, ic3, ic4 = st.columns(4)
+            ic1.markdown(f"**معرف المستخدم (`User ID`):** `{sel_rec['user_id']}` (`{sel_rec['username']}`)")
+            ic2.markdown(f"**الطابع الزمني (`UTC`):** `{sel_rec['timestamp_utc']}`")
+            ic3.markdown(f"**نوع المعاملة:** {sel_rec['transaction_type_ar']}")
+            ic4.markdown(f"**المبلغ والمرجع:** `{sel_rec['financial_amount']:,.2f} ريال` | `{sel_rec['reference_number']}`")
+
+            if sel_rec["changed_fields"]:
+                st.markdown("###### **📋 جدول مقارنة الحقول المعدلة (Field-by-Field Modification Diff):**")
+                diff_rows = []
+                for fld in sel_rec["changed_fields"]:
+                    before_v = sel_rec["old_values"].get(fld, "— (غير موجود / إنشاء)")
+                    after_v = sel_rec["new_values"].get(fld, "—")
+                    diff_rows.append({
+                        "اسم الحقل المالي (Field)": fld,
+                        "القيمة السابقة قبل التعديل (Before)": str(before_v),
+                        "القيمة الجديدة بعد العملية (After)": str(after_v),
+                        "حالة التغيير": "تعديل قيمة 🔄" if fld in sel_rec["old_values"] and fld in sel_rec["new_values"] else "إضافة/تحديث ➕",
+                    })
+                st.dataframe(pd.DataFrame(diff_rows), use_container_width=True, hide_index=True)
+
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                st.markdown("**⏪ القيم السابقة قبل التعديل (`old_values_json`):**")
+                if sel_rec["old_values"]:
+                    st.code(json.dumps(sel_rec["old_values"], ensure_ascii=False, indent=2), language="json")
+                else:
+                    st.caption("لا توجد قيم سابقة (عملية إنشاء أولية للمستند المالي).")
+            with sc2:
+                st.markdown("**⏩ القيم الجديدة بعد العملية (`new_values_json`):**")
+                if sel_rec["new_values"]:
+                    st.code(json.dumps(sel_rec["new_values"], ensure_ascii=False, indent=2), language="json")
+                else:
+                    st.caption(sel_rec["details"] or "-")
+
+            st.markdown(
+                f"🔗 **البصمة السابقة (`Previous Chain Hash`):** `{sel_rec['previous_hash']}`  \n"
+                f"🛡️ **بصمة السجل الحالية (`Entry SHA-256 Hash`):** `{sel_rec['entry_hash']}` — "
+                f"**{'مطابقة وسليمة تشفيرياً ✅' if sel_rec['is_hash_valid'] else 'تحذير: البصمة غير مطابقة ❌'}**"
+            )
 
 
 # =============================================================================
@@ -1255,7 +1782,10 @@ elif menu_option == "🛡️ الرقابة المالية: أعمار الدي�
                 st.markdown("##### **📤 استعادة نسخة احتياطية لقاعدة البيانات (.db):**")
                 up_db_file = st.file_uploader("ارفع ملف قاعدة البيانات الاحتياطي (.db):", type=["db", "sqlite", "sqlite3"], key="restore_db_up")
                 if up_db_file is not None:
-                    if st.button("🔄 استبدال واستعادة النسخة الاحتياطية الآن", type="primary", disabled=not has_perm("act_reset_db")):
+                    can_restore_db = has_perm("act_reset_db") and has_perm("act_cloud_backup")
+                    if not can_restore_db:
+                        st.warning("🔒 استعادة قاعدة البيانات تتطلب صلاحية إعادة تهيئة النظام (`act_reset_db`) وصلاحية النسخ الاحتياطي (`act_cloud_backup`).")
+                    if st.button("🔄 استبدال واستعادة النسخة الاحتياطية الآن", type="primary", disabled=not can_restore_db):
                         raw_bytes = up_db_file.getvalue()
                         if not raw_bytes.startswith(b"SQLite format 3\x00"):
                             st.error("❌ الملف المرفوع ليس ملف قاعدة بيانات SQLite صالحاً!")
@@ -1274,7 +1804,8 @@ elif menu_option == "🛡️ الرقابة المالية: أعمار الدي�
                                 if os.path.exists(target_db_p):
                                     shutil.copy2(target_db_p, os.path.join(BASE_DIR, "mizanpro_pre_restore_backup.db"))
                                 shutil.move(tmp_path, target_db_p)
-                                st.success("✅ تم التحقق من سلامة النسخة الاحتياطية واستعادتها بأمان!")
+                                init_database_and_seed(seed_demo_data=False)
+                                st.success("✅ تم التحقق من سلامة النسخة الاحتياطية واستعادتها وتدوير أي رموز دخول مكشوفة بأمان!")
                                 st.rerun()
                             except Exception as ex_db:
                                 if os.path.exists(tmp_path):
@@ -1553,10 +2084,11 @@ elif menu_option == "📦 المخزون والعملاء والموردون":
 # =============================================================================
 elif menu_option == "🧾 المبيعات وإشعارات الدائن":
     st.markdown("### **دورة المبيعات الضريبية وإشعارات الدائن (ZATCA E-Invoicing)**")
-    tab_create, tab_return, tab_history = st.tabs([
+    tab_create, tab_return, tab_history, tab_zatca_p2 = st.tabs([
         "📝 إصدار فاتورة مبيعات ضريبية",
         "↩️ إصدار إشعار دائن (مرتجع مبيعات)",
-        "📂 أرشيف الفواتير والإشعارات والطباعة"
+        "📂 أرشيف الفواتير والإشعارات والطباعة",
+        "🛡️ فاحص المرحلة الثانية والختم التشفيري 3D (ZATCA Phase 2)"
     ])
 
     db = get_db_session()
@@ -1628,6 +2160,17 @@ elif menu_option == "🧾 المبيعات وإشعارات الدائن":
                 inv_type = inv_type_map[selected_inv_label]
             with f6:
                 sel_cc_s = cc_choices[st.selectbox("مركز التكلفة / المشروع:", list(cc_choices.keys()), key="s_cc")]
+
+            # فحص حي فوري للمعرفات الضريبية قبل الإصدار (ZATCA Phase 2 Real-time Tax ID Check)
+            seller_vat_chk = ZATCAPhase2Validator.validate_saudi_vat_number(settings.vat_number, party_role="SELLER", required=True)
+            buyer_vat_req = (inv_type == InvoiceType.STANDARD)
+            buyer_vat_chk = ZATCAPhase2Validator.validate_saudi_vat_number(cust_vat, party_role="BUYER", required=buyer_vat_req)
+            if not seller_vat_chk["is_valid"]:
+                st.warning(f"⚠️ تنبيه ZATCA (الرقم الضريبي للمنشأة): {seller_vat_chk['message_ar']}")
+            if not buyer_vat_chk["is_valid"]:
+                st.warning(f"⚠️ تنبيه ZATCA (الرقم الضريبي للعميل): {buyer_vat_chk['message_ar']}")
+            elif cust_vat and str(cust_vat).strip():
+                st.caption(f"✅ المعرف الضريبي للعميل مطابق لمعيار ZATCA Phase 2 (`{buyer_vat_chk['clean_vat']}` — {buyer_vat_chk['registration_type_ar']})")
 
             if "invoice_items_count" not in st.session_state:
                 st.session_state.invoice_items_count = 1
@@ -1819,6 +2362,165 @@ elif menu_option == "🧾 المبيعات وإشعارات الدائن":
                 sel_i_obj = inv_opts[st.selectbox("اختر فاتورة مبيعات لطباعتها:", list(inv_opts.keys()))]
                 html_doc = PrintTemplateService.generate_sales_invoice_html(sel_i_obj, settings)
                 components.html(html_doc, height=680, scrolling=True)
+
+        with tab_zatca_p2:
+            st.markdown("#### **🛡️ محرك التحقق من الفوترة الإلكترونية للمرحلة الثانية (ZATCA Fatoora Phase 2 — الربط والتكامل)**")
+            st.caption(
+                "يفحص هذا المحرك كافة المستندات المالية (فواتير المبيعات، فواتير المشتريات، الإشعارات الدائنة والمدينة، وسندات الخزينة) "
+                "وفق قواعد هيئة الزكاة والضريبة والجمارك للمرحلة الثانية (`BR-KSA-39`, `BR-KSA-40`, `BR-KSA-68`, `KSA-1 UUID`, `KSA-13 PIH`, `KSA-16 ICV`, `TLV Tags 1..9`, `UBL 2.1 XML`)."
+            )
+            audit_summary = ZATCAPhase2Validator.audit_all_database_documents(db, auto_upgrade_phase2=True)
+            zm1, zm2, zm3, zm4 = st.columns(4)
+            zm1.metric("إجمالي المستندات المالية المفحوصة", f"{audit_summary['total_documents']}")
+            zm2.metric("المستندات المتوافقة 100% (Phase 2)", f"{audit_summary['compliant_documents']}")
+            zm3.metric("نسبة امتثال ZATCA Phase 2", f"{audit_summary['overall_compliance_pct']:.1f}%")
+            zm4.metric("مستندات تم ترقية ختمها التشفيري", f"{audit_summary['upgraded_count']}")
+
+            if audit_summary["reports"]:
+                doc_choices_p2 = {
+                    f"[{r['doc_title_ar']}] {r['doc_number']} | {r['counterparty_name']} ({r['grand_total']:,.2f} ريال) — {'✅ متوافق' if r['phase2_compliant'] else '❌ غير متوافق'}": r
+                    for r in audit_summary["reports"]
+                }
+                sel_rep_lbl = st.selectbox("🔍 اختر مستنداً مالياً لفحص قواعد ZATCA Phase 2 والـ QR TLV (Tags 1–9) والمجسم التشفيري 3D:", list(doc_choices_p2.keys()))
+                sel_rep = doc_choices_p2[sel_rep_lbl]
+
+                # عرض المشهد التفاعلي ثلاثي الأبعاد (Three.js 3D Cryptographic & QR Voxel Inspector)
+                st.markdown("##### **🌐 المعاين التفاعلي ثلاثي الأبعاد للختم التشفيري وباركود المرحلة الثانية (3D ZATCA Cryptographic & QR Voxel Inspector):**")
+                three_html = ZATCAPhase2Validator.render_zatca_3d_inspector_html(sel_rep)
+                components.html(three_html, height=540, scrolling=False)
+
+                z_col1, z_col2 = st.columns([1.25, 1])
+                with z_col1:
+                    st.markdown("##### **📋 نتائج فحص قواعد الأعمال السعودية (`BR-KSA-*` & `BR-CO-*`):**")
+                    rules_df = pd.DataFrame([
+                        {
+                            "كود القاعدة": rc["rule_id"],
+                            "اسم القاعدة": rc["title_ar"],
+                            "الحالة": "✅ مطابق" if rc["passed"] else "❌ مخالف",
+                            "التفاصيل الفنية": rc["details_ar"]
+                        }
+                        for rc in sel_rep["checks"]
+                    ])
+                    st.dataframe(rules_df, use_container_width=True, hide_index=True)
+
+                with z_col2:
+                    st.markdown("##### **🔐 تفكيك حقول باركود TLV للمرحلة الثانية (Tags 1–9):**")
+                    qr_tags = sel_rep.get("decoded_qr", {}).get("tags", {})
+                    tlv_rows = []
+                    for t_id in range(1, 10):
+                        t_info = qr_tags.get(t_id, {})
+                        spec_info = ZATCA_TLV_TAG_SPECS.get(t_id, {})
+                        val_disp = str(t_info.get("value", "غير موجود"))
+                        if len(val_disp) > 42:
+                            val_disp = val_disp[:39] + "..."
+                        tlv_rows.append({
+                            "Tag": f"Tag {t_id}",
+                            "البيان (ZATCA Spec)": spec_info.get("name_ar", f"Tag {t_id}"),
+                            "الطول (Bytes)": t_info.get("byte_length", 0),
+                            "القيمة المفككة": val_disp,
+                        })
+                    st.dataframe(pd.DataFrame(tlv_rows), use_container_width=True, hide_index=True)
+
+                with st.expander("📄 استعراض وتحميل ملف الفاتورة الإلكترونية القياسي (ZATCA UBL 2.1 XML & TLV Base64)"):
+                    st.text_area("TLV Base64 QR Payload (Tags 1–9):", value=sel_rep["qr_code_base64"], height=68)
+                    st.code(sel_rep["ubl_xml"], language="xml")
+                    st.download_button(
+                        "📥 تحميل ملف الفاتورة الإلكترونية (ZATCA UBL 2.1 XML)",
+                        data=sel_rep["ubl_xml"].encode("utf-8"),
+                        file_name=f"ZATCA_Phase2_{sel_rep['doc_number']}.xml",
+                        mime="application/xml",
+                        key=f"dl_xml_{sel_rep['doc_number']}"
+                    )
+
+            st.divider()
+            st.markdown("#### **📲 أداة توليد وفك تشفير باركود الفاتورة الإلكترونية (ZATCA Phase 2 TLV Base64 QR Generator & Decoder)**")
+            st.caption(
+                "توليد وفك تشفير رموز الاستجابة السريعة (`TLV Base64`) المتوافقة مع المرحلة الثانية لهيئة الزكاة والضريبة والجمارك "
+                "شاملةً: اسم البائع (`Tag 1`)، الرقم الضريبي 15 رقماً (`Tag 2`)، الطابع الزمني القياسي `ISO-8601` (`Tag 3`)، "
+                "إجمالي الفاتورة مع الضريبة (`Tag 4`)، مبلغ الضريبة (`Tag 5`)، وأختام التشفير الرقمية للمرحلة الثانية (`Tags 6–9`)."
+            )
+
+            qr_u_col1, qr_u_col2 = st.columns([1.15, 1])
+            with qr_u_col1:
+                u_seller = st.text_input("1️⃣ اسم البائع (Seller Name — Tag 1 UTF-8):", value=settings.company_name_ar, key="z_qr_u_seller")
+                u_vat_no = st.text_input("2️⃣ الرقم الضريبي للبائع (VAT Number — Tag 2, 15 digits):", value=settings.vat_number, key="z_qr_u_vat")
+                u_ts_iso = st.text_input("3️⃣ الطابع الزمني للفاتورة (ISO-8601 Timestamp — Tag 3):", value=format_zatca_timestamp(), key="z_qr_u_ts")
+                u_c1, u_c2 = st.columns(2)
+                with u_c1:
+                    u_inv_total = st.number_input("4️⃣ إجمالي الفاتورة شامل الضريبة (Tag 4):", min_value=0.0, value=1150.00, step=50.0, format="%.2f", key="z_qr_u_tot")
+                with u_c2:
+                    default_u_vat = round(u_inv_total - (u_inv_total / 1.15), 2)
+                    u_vat_total = st.number_input("5️⃣ مبلغ ضريبة القيمة المضافة 15% (Tag 5):", min_value=0.0, value=default_u_vat, step=7.5, format="%.2f", key="z_qr_u_vtot")
+                u_phase2_chk = st.checkbox("تضمين أختام المرحلة الثانية التشفيرية (Phase 2 Cryptographic Tags 6–9: SHA-256 XML Hash + ECDSA + Public Key + CSID)", value=True, key="z_qr_u_p2")
+
+            with qr_u_col2:
+                try:
+                    gen_b64 = generate_zatca_tlv_qr_base64(
+                        seller_name=u_seller,
+                        vat_number=u_vat_no,
+                        timestamp=u_ts_iso,
+                        invoice_total=u_inv_total,
+                        vat_total=u_vat_total,
+                        phase2=u_phase2_chk,
+                    )
+                    dec_info = decode_zatca_tlv_qr_base64(gen_b64)
+                    svg_uri = LedgerService.generate_qr_svg_data_uri(gen_b64, size=150)
+                    st.markdown(
+                        f"""
+                        <div style="background:#FFFFFF; border:1px solid #CBD5E1; border-radius:10px; padding:14px; text-align:center;">
+                            <img src="{svg_uri}" width="145" height="145" style="border:1px solid #E2E8F0; padding:4px; border-radius:8px;" />
+                            <div style="font-size:12px; font-weight:700; color:#0F172A; margin-top:6px;">
+                                ZATCA TLV Base64 QR ({dec_info['raw_byte_length']} Bytes | {'Phase 2 Tags 1–9' if dec_info['has_phase2_tags'] else 'Phase 1 Tags 1–5'}) ✅
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    st.text_area("📦 سلسلة الباركود المشفرة (Base64 TLV Output):", value=gen_b64, height=86, key="z_qr_u_b64_out")
+                except Exception as qr_err:
+                    gen_b64 = ""
+                    st.error(f"❌ خطأ في التحقق من بيانات الباركود: {qr_err}")
+
+            if gen_b64:
+                seg_rows = ZATCATLVQRGenerator.inspect_tlv_binary_segments(gen_b64)
+                if seg_rows:
+                    with st.expander("🔬 تشريح البنية الثنائية لحقول TLV بايت ببايت (Binary TLV Tag-Length-Value Breakdown)", expanded=False):
+                        st.dataframe(
+                            pd.DataFrame([
+                                {
+                                    "رقم الحقل (Tag)": f"Tag {r['tag_number']} ({r['tag_hex']})",
+                                    "الكود القياسي": r["code"],
+                                    "المرحلة": r["phase"],
+                                    "البيان": r["name_ar"],
+                                    "الطول (Bytes)": f"{r['length_bytes']} ({r['length_hex']})",
+                                    "القيمة المفككة (UTF-8 / Base64)": r["value"][:56] + ("..." if len(r["value"]) > 56 else ""),
+                                    "أول 16 بايت (Hex)": r["hex_preview"],
+                                }
+                                for r in seg_rows
+                            ]),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+            # سجل موحد لرموز QR TLV Base64 لكافة الفواتير والإشعارات في النظام
+            if audit_summary["reports"]:
+                with st.expander("📋 سجل رموز الاستجابة السريعة (ZATCA Base64 TLV QR Registry) لكافة الفواتير والإشعارات المسجلة", expanded=False):
+                    inv_qr_rows = []
+                    for r in audit_summary["reports"]:
+                        d_qr = decode_zatca_tlv_qr_base64(r.get("qr_code_base64", ""))
+                        inv_qr_rows.append({
+                            "رقم المستند": r["doc_number"],
+                            "نوع المستند": r["doc_title_ar"],
+                            "اسم البائع (Tag 1)": d_qr.get("seller_name", r["seller_name"]),
+                            "الرقم الضريبي (Tag 2)": d_qr.get("vat_number", r["seller_vat"]),
+                            "الطابع الزمني ISO-8601 (Tag 3)": d_qr.get("timestamp", "-"),
+                            "إجمالي الفاتورة (Tag 4)": d_qr.get("invoice_total", f"{r['grand_total']:.2f}"),
+                            "إجمالي الضريبة (Tag 5)": d_qr.get("vat_total", f"{r['vat_amount']:.2f}"),
+                            "حجم TLV (Bytes)": d_qr.get("raw_byte_length", 0),
+                            "حالة Phase 2 (Tags 1–9)": "مكتمل ✅" if d_qr.get("has_phase2_tags") else "جزئي ⚠️",
+                            "Base64 TLV Payload": (r.get("qr_code_base64") or "")[:44] + "...",
+                        })
+                    st.dataframe(pd.DataFrame(inv_qr_rows), use_container_width=True, hide_index=True)
     finally:
         db.close()
 
@@ -1930,9 +2632,15 @@ elif menu_option == "📥 المشتريات وإشعارات المدين":
                         performed_by=get_active_user_label()
                     )
                     st.session_state["latest_purchase_id"] = new_pur.id
-                    st.success(f"🎉 تم تسجيل فاتورة المشتريات برقم: {new_pur.invoice_number}")
+                    st.success(f"🎉 تم تسجيل فاتورة المشتريات برقم: {new_pur.invoice_number} وتوليد رمز ZATCA TLV QR تلقائياً")
                 except Exception as e:
                     st.error(f"❌ {str(e)}")
+
+            if "latest_purchase_id" in st.session_state:
+                latest_pur = db.query(PurchaseInvoice).filter(PurchaseInvoice.id == st.session_state["latest_purchase_id"]).first()
+                if latest_pur:
+                    pur_html = PrintTemplateService.generate_purchase_invoice_html(latest_pur, settings)
+                    components.html(pur_html, height=680, scrolling=True)
 
         with tab_pur_return:
             pinvs = db.query(PurchaseInvoice).order_by(PurchaseInvoice.id.desc()).all()
@@ -2431,20 +3139,30 @@ elif menu_option == "🏛️ القوائم المالية والزكاة وال
         settings = LedgerService.get_company_settings(db)
         fs_c1, fs_c2, fs_c3, fs_c4 = st.columns([1.2, 1, 1, 1.5])
         with fs_c1:
-            fs_use_dt = st.checkbox("تحديد فترة مالية مخصصة للقوائم", value=False, key="fs_flt")
+            fs_use_dt = st.checkbox("تحديد فترة مالية مخصصة للقوائم", value=True, key="fs_flt")
         with fs_c2:
             fs_sdt = st.date_input("من تاريخ:", value=date(settings.fiscal_year, 1, 1), disabled=not fs_use_dt, key="fs_sdt")
         with fs_c3:
-            fs_edt = st.date_input("إلى تاريخ:", value=date.today(), disabled=not fs_use_dt, key="fs_edt")
+            fs_edt = st.date_input("إلى تاريخ:", value=date(settings.fiscal_year, 12, 31), disabled=not fs_use_dt, key="fs_edt")
+
+        eff_sdt = fs_sdt if fs_use_dt else date(settings.fiscal_year, 1, 1)
+        eff_edt = fs_edt if fs_use_dt else date(settings.fiscal_year, 12, 31)
 
         tb_df = LedgerService.get_live_trial_balance(
             db,
-            start_date=fs_sdt if fs_use_dt else None,
-            end_date=fs_edt if fs_use_dt else None,
+            start_date=eff_sdt,
+            end_date=eff_edt,
             include_zero_balances=True
         )
-        engine = FinancialStatementsEngine(trial_balance_df=tb_df, fiscal_year=settings.fiscal_year, vat_rate=settings.default_vat_rate)
+        engine = FinancialStatementsEngine(
+            trial_balance_df=tb_df,
+            fiscal_year=settings.fiscal_year,
+            vat_rate=settings.default_vat_rate,
+            start_date=eff_sdt,
+            end_date=eff_edt
+        )
         report = engine.generate_full_financial_report()
+        subledger_rec = LedgerService.reconcile_subledgers_with_gl(db, end_date=eff_edt)
 
         pnl = report["income_statement"]
         bs = report["balance_sheet"]
@@ -2452,6 +3170,26 @@ elif menu_option == "🏛️ القوائم المالية والزكاة وال
         vat = report["vat_return"]
         zakat = report["zakat_declaration"]
         ratios = report["financial_ratios"]
+        pre_audit = report["pre_approval_audit"]
+
+        all_reconciled_ready = bool(pre_audit["is_approved_ready"] and subledger_rec["all_reconciled"])
+        official_signoff = st.checkbox(
+            "✅ اعتماد المخرجات رسمياً بعد مراجعة مطابقات القوائم المالية وVAT والزكاة والأستاذ المساعد (Official Sign-off)",
+            value=False,
+            disabled=not (all_reconciled_ready and has_perm("act_approve_journal")),
+            key="chk_official_report_approval"
+        )
+        approval_badge_text = (
+            "معتمد رسمياً للإقرار (Officially Approved) ✅"
+            if (official_signoff and all_reconciled_ready)
+            else "مسودة قيد المراجعة — غير معتمدة للإقرار الرسمي قبل إتمام المراجعة ⚠️"
+        )
+
+        st.info(
+            f"📅 **نطاق الفترة المالية للتقارير:** قائمة الدخل والتدفقات وإقرار الضريبة **{report['period_label_ar']}** | "
+            f"قائمة المركز المالي **{report['as_of_label_ar']}**  \n"
+            f"🛡️ **حالة الاعتماد الرسمي:** `{approval_badge_text}`"
+        )
 
         with fs_c4:
             st.markdown("<br>", unsafe_allow_html=True)
@@ -2459,25 +3197,28 @@ elif menu_option == "🏛️ القوائم المالية والزكاة وال
             st.download_button(
                 "📊 تصدير القوائم المالية والزكاة والضريبة (Excel)",
                 data=xl_bytes,
-                file_name=f"MizanPro_Financial_Package_{settings.fiscal_year}.xlsx",
+                file_name=f"MizanPro_Financial_Package_{eff_sdt}_{eff_edt}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
                 type="primary",
                 disabled=not has_perm("act_export_reports")
             )
 
-        t1, t2, t3, t4, t5, t6 = st.tabs([
+        t1, t2, t3, t4, t5, t6, t7, t8 = st.tabs([
             "📈 قائمة الدخل", "🏛️ المركز المالي", "💵 التدفقات النقدية",
-            "🧾 إقرار القيمة المضافة (VAT)", "🕌 إقرار الزكاة (ZATCA)", "📊 المؤشرات والنسب المالية"
+            "🧾 إقرار القيمة المضافة (VAT)", "🕌 إقرار الزكاة (ZATCA)",
+            "📊 المؤشرات والنسب المالية", "🛡️ فحص المطابقة قبل الاعتماد",
+            "📲 امتثال الفوترة الإلكترونية (ZATCA Phase 2)"
         ])
         with t1:
+            st.caption(f"📌 **قائمة الدخل {pnl['period_label_ar']}** — تعتمد حصرياً على حركات الفترة الواقعة بين `{pnl['start_date']}` و `{pnl['end_date']}` | الحالة: **{approval_badge_text}**")
             st.table(pd.DataFrame([
-                {"البند": "إجمالي إيرادات المبيعات والخدمات", "المبلغ (ريال)": f"{pnl['gross_sales']:,.2f}"},
-                {"البند": "يخصم: مردودات المبيعات والخصم المسموح به", "المبلغ (ريال)": f"({(pnl['sales_returns'] + pnl['sales_discounts']):,.2f})"},
-                {"البند": "صافي الإيرادات التشغيلية", "المبلغ (ريال)": f"{pnl['net_revenue']:,.2f}"},
+                {"البند": "إجمالي إيرادات المبيعات والخدمات (حركة الفترة)", "المبلغ (ريال)": f"{pnl['gross_sales']:,.2f}"},
+                {"البند": "يخصم: مردودات المبيعات والخصم المسموح به (حركة الفترة)", "المبلغ (ريال)": f"({(pnl['sales_returns'] + pnl['sales_discounts']):,.2f})"},
+                {"البند": "صافي الإيرادات التشغيلية للفترة", "المبلغ (ريال)": f"{pnl['net_revenue']:,.2f}"},
                 {"البند": "يخصم: صافي تكلفة البضاعة المباعة (COGS)", "المبلغ (ريال)": f"({pnl['cost_of_sales']:,.2f})"},
                 {"البند": "مجمل الربح التشغيلي (Gross Profit)", "المبلغ (ريال)": f"{pnl['gross_profit']:,.2f} ({pnl['gross_margin_pct']:.1f}%)"},
-                {"البند": "يخصم: إجمالي المصروفات التشغيلية والإدارية والعمومية", "المبلغ (ريال)": f"({pnl['operating_expenses']['total']:,.2f})"},
+                {"البند": "يخصم: إجمالي المصروفات التشغيلية والإدارية والعمومية للفترة", "المبلغ (ريال)": f"({pnl['operating_expenses']['total']:,.2f})"},
                 {"البند": "صافي الربح التشغيلي (Operating Profit - EBIT)", "المبلغ (ريال)": f"{pnl['operating_profit']:,.2f}"},
                 {"البند": "الإيرادات الأخرى - (المصروفات التمويلية والبنكية)", "المبلغ (ريال)": f"{(pnl['other_income'] - pnl['financial_charges']):,.2f}"},
                 {"البند": "صافي الربح قبل الزكاة الشرعية", "المبلغ (ريال)": f"{pnl['profit_before_zakat']:,.2f}"},
@@ -2485,13 +3226,14 @@ elif menu_option == "🏛️ القوائم المالية والزكاة وال
                 {"البند": "💰 صافي ربح / (خسارة) الفترة النهائي", "المبلغ (ريال)": f"{pnl['net_profit']:,.2f} ({pnl['net_margin_pct']:.1f}%)"},
             ]))
             if pnl["operating_expenses"]["breakdown"]:
-                with st.expander("🔍 استعراض تفصيل بنود المصروفات التشغيلية والإدارية"):
+                with st.expander("🔍 استعراض تفصيل بنود المصروفات التشغيلية والإدارية خلال الفترة"):
                     st.table(pd.DataFrame([
                         {"كود الحساب": x["code"], "اسم حساب المصروف": x["name"], "المبلغ (ريال)": f"{x['amount']:,.2f}"}
                         for x in pnl["operating_expenses"]["breakdown"]
                     ]))
 
         with t2:
+            st.caption(f"📌 **قائمة المركز المالي {bs['as_of_label_ar']}** | الحالة: **{approval_badge_text}**")
             bs_m1, bs_m2, bs_m3 = st.columns(3)
             bs_m1.metric("إجمالي الأصول", f"{bs['total_assets']:,.2f} ريال")
             bs_m2.metric("إجمالي الالتزامات وحقوق الملكية", f"{bs['total_liabilities_and_equity']:,.2f} ريال")
@@ -2522,6 +3264,7 @@ elif menu_option == "🏛️ القوائم المالية والزكاة وال
             st.table(pd.DataFrame(bs_rows))
 
         with t3:
+            st.caption(f"📌 **قائمة التدفقات النقدية (IAS 7) {cf['period_label_ar']}** | الحالة: **{approval_badge_text}**")
             op_cf = cf["operating_activities"]
             wc_cf = op_cf["working_capital_changes"]
             inv_cf = cf["investing_activities"]
@@ -2542,17 +3285,19 @@ elif menu_option == "🏛️ القوائم المالية والزكاة وال
             st.table(pd.DataFrame(cf_rows))
 
         with t4:
+            st.caption(f"📌 **إقرار ضريبة القيمة المضافة (ZATCA VAT Return) {vat['period_label_ar']}** — محسوب حصرياً من حركات الفترة (`{vat['start_date']}` إلى `{vat['end_date']}`) بتقريب `ROUND_HALF_UP` | الحالة: **{approval_badge_text}**")
             v1, v2, v3 = st.columns(3)
-            v1.metric("إجمالي ضريبة المخرجات (المبيعات)", f"{vat['box_1_std_sales']['vat_amount']:,.2f} ريال")
-            v2.metric("إجمالي ضريبة المدخلات القابلة للخصم", f"{vat['box_7_std_purchases']['recoverable_vat']:,.2f} ريال")
-            v3.metric("صافي الضريبة المستحقة / (المستردة)", f"{vat['net_vat_due']:,.2f} ريال", delta=vat["settlement_status"])
+            v1.metric("إجمالي ضريبة المخرجات للفترة (المبيعات)", f"{vat['box_1_std_sales']['vat_amount']:,.2f} ريال")
+            v2.metric("إجمالي ضريبة المدخلات القابلة للخصم للفترة", f"{vat['box_7_std_purchases']['recoverable_vat']:,.2f} ريال")
+            v3.metric("صافي الضريبة المستحقة / (المستردة) للفترة", f"{vat['net_vat_due']:,.2f} ريال", delta=vat["settlement_status"])
             st.table(pd.DataFrame([
-                {"رقم الحقل في نموذج ZATCA": "1", "البيان": vat["box_1_std_sales"]["label"], "المبلغ الخاضع (ريال)": f"{vat['box_1_std_sales']['taxable_amount']:,.2f}", "مبلغ الضريبة (15%)": f"{vat['box_1_std_sales']['vat_amount']:,.2f}"},
-                {"رقم الحقل في نموذج ZATCA": "7", "البيان": vat["box_7_std_purchases"]["label"], "المبلغ الخاضع (ريال)": f"{vat['box_7_std_purchases']['taxable_amount']:,.2f}", "مبلغ الضريبة (15%)": f"({vat['box_7_std_purchases']['recoverable_vat']:,.2f})"},
-                {"رقم الحقل في نموذج ZATCA": "14", "البيان": f"صافي ضريبة القيمة المضافة ({vat['settlement_status']})", "المبلغ الخاضع (ريال)": "-", "مبلغ الضريبة (15%)": f"{vat['net_vat_due']:,.2f}"},
+                {"رقم الحقل في نموذج ZATCA": "1", "البيان": vat["box_1_std_sales"]["label"], "المبلغ الخاضع للفترة (ريال)": f"{vat['box_1_std_sales']['taxable_amount']:,.2f}", "مبلغ الضريبة (15%)": f"{vat['box_1_std_sales']['vat_amount']:,.2f}"},
+                {"رقم الحقل في نموذج ZATCA": "7", "البيان": vat["box_7_std_purchases"]["label"], "المبلغ الخاضع للفترة (ريال)": f"{vat['box_7_std_purchases']['taxable_amount']:,.2f}", "مبلغ الضريبة (15%)": f"({vat['box_7_std_purchases']['recoverable_vat']:,.2f})"},
+                {"رقم الحقل في نموذج ZATCA": "14", "البيان": f"صافي ضريبة القيمة المضافة عن الفترة ({vat['settlement_status']})", "المبلغ الخاضع للفترة (ريال)": f"{vat['period_label_ar']}", "مبلغ الضريبة (15%)": f"{vat['net_vat_due']:,.2f}"},
             ]))
 
         with t5:
+            st.caption(f"📌 **إقرار الزكاة الشرعية (ZATCA) {zakat['period_label_ar']}** | الحالة: **{approval_badge_text}**")
             z1, z2, z3 = st.columns(3)
             z1.metric("إجمالي الإضافات للوعاء الزكوي", f"{zakat['additions_to_zakat_base']['total_additions']:,.2f} ريال")
             z2.metric("إجمالي الحسميات من الوعاء", f"{zakat['deductions_from_zakat_base']['total_deductions']:,.2f} ريال")
@@ -2586,6 +3331,64 @@ elif menu_option == "🏛️ القوائم المالية والزكاة وال
                 {"المجموعة": "مؤشرات الكفاءة والرفع المالي", "المؤشر المالي": "العائد على حقوق الملكية (ROE %)", "القيمة": f"{ratios['return_on_equity_pct']:.2f}%"},
                 {"المجموعة": "مؤشرات الكفاءة والرفع المالي", "المؤشر المالي": "نسبة المديونية إلى الأصول (Debt to Assets %)", "القيمة": f"{ratios['debt_to_assets_pct']:.2f}%"},
             ]))
+
+        with t7:
+            st.markdown("##### **🛡️ مصفوفة المراجعة والمطابقة المحاسبية والزكوية والضريبية قبل الاعتماد الرسمي:**")
+            st.caption("تُعامل كافة المخرجات والتقارير كـ **(مسودة قيد المراجعة)** ولا تُعتمد رسمياً إلا بعد اجتياز كافة فحوصات المطابقة أدناه:")
+            chk_rows = []
+            for c_item in pre_audit["checks"]:
+                chk_rows.append({
+                    "بند الفحص والمطابقة": c_item["check_name"],
+                    "القيمة المتوقعة / الدفترية": f"{c_item['expected']:,.2f}",
+                    "القيمة الفعلية بالتقرير": f"{c_item['actual']:,.2f}",
+                    "الفرق": f"{c_item['difference']:,.2f}",
+                    "النتيجة": "مطابق ✅" if c_item["passed"] else "غير مطابق ❌"
+                })
+            for s_item in subledger_rec["checks"]:
+                chk_rows.append({
+                    "بند الفحص والمطابقة": s_item["check_name"],
+                    "القيمة المتوقعة / الدفترية": f"{s_item['gl_balance']:,.2f}",
+                    "القيمة الفعلية بالتقرير": f"{s_item['subledger_balance']:,.2f}",
+                    "الفرق": f"{s_item['difference']:,.2f}",
+                    "النتيجة": "مطابق ✅" if s_item["passed"] else "غير مطابق ❌"
+                })
+            st.table(pd.DataFrame(chk_rows))
+
+        with t8:
+            st.markdown("##### **📲 تقرير امتثال كافة المستندات المالية لمتطلبات المرحلة الثانية (ZATCA Phase 2 — Fatoora Integration):**")
+            p2_audit = ZATCAPhase2Validator.audit_all_database_documents(db, auto_upgrade_phase2=True)
+            za1, za2, za3, za4 = st.columns(4)
+            za1.metric("إجمالي المستندات المالية", f"{p2_audit['total_documents']}")
+            za2.metric("المستندات المتوافقة (Tags 1–9)", f"{p2_audit['compliant_documents']}")
+            za3.metric("المستندات غير المتوافقة", f"{p2_audit['non_compliant_documents']}")
+            za4.metric("نسبة الامتثال الكلية", f"{p2_audit['overall_compliance_pct']:.1f}%")
+
+            if p2_audit["reports"]:
+                summary_rows = []
+                for r in p2_audit["reports"]:
+                    summary_rows.append({
+                        "نوع المستند": r["doc_title_ar"],
+                        "رقم المستند": r["doc_number"],
+                        "الطرف": r["counterparty_name"],
+                        "الرقم الضريبي للمنشأة": r["seller_vat"] or "❌",
+                        "الرقم الضريبي للطرف": r["counterparty_vat"] or "مبسطة/نقدي",
+                        "عدد حقول QR TLV": len(r["decoded_qr"].get("tags", {})),
+                        "UUID (KSA-1)": r["uuid"][:18] + "...",
+                        "الإجمالي (ريال)": f"{r['grand_total']:,.2f}",
+                        "حالة ZATCA Phase 2": "متوافق 100% ✅" if r["phase2_compliant"] else "يحتاج مراجعة ❌"
+                    })
+                st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+    finally:
+        db.close()
+
+
+# =============================================================================
+# 13.ب الشاشة المستقلة: سجل التدقيق الرقابي للقراءة فقط (ZATCA Read-Only Audit Log)
+# =============================================================================
+elif menu_option == "🔍 سجل التدقيق الرقابي للقراءة فقط (ZATCA Audit Log)":
+    db = get_db_session()
+    try:
+        render_readonly_zatca_audit_log_module(db, key_prefix="standalone_zatca_audit")
     finally:
         db.close()
 
@@ -2599,7 +3402,7 @@ elif menu_option == "🌳 شجرة الحسابات، الإعدادات، وص�
         "👥 إدارة المستخدمين والتخصيص الحر للصلاحيات",
         "🌳 شجرة الحسابات (COA)",
         "⚙️ إعدادات المنشأة والضريبة",
-        "🛡️ سجل الرقابة والتدقيق (Audit Trail)"
+        "🛡️ سجل الرقابة والتدقيق الإلزامي للقراءة فقط (ZATCA Read-Only Audit Log)"
     ])
 
     db = get_db_session()
@@ -2655,9 +3458,10 @@ elif menu_option == "🌳 شجرة الحسابات، الإعدادات، وص�
                 sel_r_label = st.selectbox("نوع الدور الأساسي:", list(role_options_map.keys()), index=default_r_idx)
                 in_role = role_options_map[sel_r_label]
             with u_col3:
-                in_pin = st.text_input("رمز الدخول السري الجديد (PIN - اتركه فارغاً للإبقاء على الرمز الحالي):", value="" if target_u else "1234", type="password")
+                in_pin = st.text_input("رمز الدخول السري الجديد (PIN - اتركه فارغاً لتوليد رمز عشوائي أو للإبقاء على الحالي):", value="", type="password")
                 in_max_disc = st.number_input("سقف نسبة الخصم المسموح بها في المبيعات (%):", min_value=0.0, max_value=100.0, value=float(target_u.max_discount_pct if target_u and target_u.max_discount_pct is not None else 15.0), step=5.0)
                 in_active = st.checkbox("الحساب نشط ومفعل للدخول", value=target_u.is_active if target_u else True)
+                in_must_chg = st.checkbox("إلزام المستخدم بتغيير الرمز عند أول دخول", value=bool(target_u.must_change_pin) if target_u else True)
 
             state_key_prefix = f"perm_state_{target_u.id if target_u else 'new'}"
             if state_key_prefix not in st.session_state:
@@ -2707,7 +3511,7 @@ elif menu_option == "🌳 شجرة الحسابات، الإعدادات، وص�
                         key=f"chk_{state_key_prefix}_{m_key}"
                     )
 
-            st.markdown("###### **2️⃣ تخصيص صلاحيات العمليات والإجراءات الدقيقة داخل النظام (16 عملية رقابية):**")
+            st.markdown(f"###### **2️⃣ تخصيص صلاحيات العمليات والإجراءات الدقيقة داخل النظام ({len(SYSTEM_ACTIONS)} عملية رقابية):**")
             act_cols = st.columns(2)
             for idx_a, (a_key, a_label) in enumerate(SYSTEM_ACTIONS.items()):
                 with act_cols[idx_a % 2]:
@@ -2731,6 +3535,7 @@ elif menu_option == "🌳 شجرة الحسابات، الإعدادات، وص�
                         permissions_dict=updated_perms,
                         max_discount_pct=in_max_disc,
                         is_active=in_active,
+                        must_change_pin=in_must_chg,
                         performed_by=get_active_user_label()
                     )
                     st.success(f"🎉 تم حفظ المستخدم ({saved_u.full_name_ar}) واعتماد صلاحياته المخصصة بنجاح!")
@@ -2824,16 +3629,6 @@ elif menu_option == "🌳 شجرة الحسابات، الإعدادات، وص�
                     st.error(f"❌ {ex_cfg}")
 
         with t_audit:
-            logs = db.query(AuditLog).order_by(AuditLog.id.desc()).limit(100).all()
-            if logs:
-                log_rows = [{
-                    "رقم العملية": l.id,
-                    "التاريخ والوقت": l.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-                    "المستخدم المسؤول": getattr(l, "performed_by", None) or "مدير النظام",
-                    "الجدول": l.table_name,
-                    "نوع الإجراء": l.action,
-                    "التفاصيل": l.details or ""
-                } for l in logs]
-                st.dataframe(pd.DataFrame(log_rows), use_container_width=True, hide_index=True)
+            render_readonly_zatca_audit_log_module(db, key_prefix="settings_tab_audit")
     finally:
         db.close()

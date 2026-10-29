@@ -20,6 +20,7 @@ from models import (
 )
 from ledger_service import LedgerService
 from financial_engine import FinancialStatementsEngine
+from zatca_phase2_validator import ZATCAPhase2Validator
 
 
 class ExcelExportService:
@@ -686,8 +687,9 @@ class PrintTemplateService:
             </tr>
             """
 
-        qr_svg_uri = LedgerService.generate_qr_svg_data_uri(invoice.qr_code_base64 or invoice.invoice_number, size=130)
-        inv_type_title = "فاتورة ضريبية مبسطة (B2C)" if invoice.invoice_type == InvoiceType.SIMPLIFIED else "فاتورة ضريبية قياسية (B2B)"
+        z_rep = ZATCAPhase2Validator.validate_financial_document(invoice, settings=settings)
+        qr_svg_uri = LedgerService.generate_qr_svg_data_uri(z_rep["qr_code_base64"], size=130)
+        inv_type_title = "فاتورة ضريبية مبسطة (B2C - 0200000)" if invoice.invoice_type == InvoiceType.SIMPLIFIED else "فاتورة ضريبية قياسية (B2B - 0100000)"
 
         return f"""
         <!DOCTYPE html>
@@ -751,7 +753,8 @@ class PrintTemplateService:
                 <div class="totals-container">
                     <div style="text-align:center;">
                         <img src="{qr_svg_uri}" width="125" height="125" style="border:1px solid #CBD5E1; padding:4px; border-radius:6px; background:white;"/>
-                        <p style="font-size:11px; color:#64748B; margin:4px 0 0 0;">رمز الاستجابة السريعة (ZATCA TLV QR)</p>
+                        <p style="font-size:11px; color:#0F172A; font-weight:bold; margin:4px 0 0 0;">ZATCA Phase 2 QR (TLV Tags 1-9) ✅</p>
+                        <p style="font-size:9.5px; color:#64748B; font-family:monospace; margin:2px 0 0 0;">UUID: {z_rep["uuid"][:18]}...</p>
                     </div>
                     <div class="totals-box">
                         <div class="totals-row"><span>المجموع قبل الخصم:</span><b>{invoice.subtotal:,.2f} ريال</b></div>
@@ -849,7 +852,11 @@ class PrintTemplateService:
                     </thead>
                     <tbody>{items_rows_html}</tbody>
                 </table>
-                <div class="totals-container">
+                <div class="totals-container" style="justify-content:space-between; align-items:center;">
+                    <div style="text-align:center;">
+                        <img src="{LedgerService.generate_qr_svg_data_uri(ZATCAPhase2Validator.validate_financial_document(invoice, settings=settings)['qr_code_base64'], size=115)}" width="115" height="115" style="border:1px solid #CBD5E1; padding:4px; border-radius:6px; background:white;"/>
+                        <p style="font-size:10.5px; color:#0F766E; font-weight:bold; margin:4px 0 0 0;">ZATCA Phase 2 Verified ✅</p>
+                    </div>
                     <div class="totals-box">
                         <div class="totals-row"><span>صافي المشتريات (غير شامل الضريبة):</span><b>{invoice.taxable_amount:,.2f} ريال</b></div>
                         <div class="totals-row"><span>ضريبة المدخلات 15% (مستردة):</span><b>{invoice.vat_amount:,.2f} ريال</b></div>
@@ -1013,10 +1020,16 @@ class PrintTemplateService:
                     <span><b>وذلك عن (البيان):</b> {html.escape(str(voucher.description or ""))}</span>
                     <span><b>المرجع:</b> {voucher.reference_number or "-"}</span>
                 </div>
-                <div style="margin-top:32px; display:flex; justify-content:space-between; font-size:13px; border-top:1px dashed #CBD5E1; padding-top:16px;">
-                    <div><b>أمين الصندوق / الخزينة:</b> ........................</div>
-                    <div><b>المحاسب المختص:</b> ........................</div>
-                    <div><b>توقيع المستلم:</b> ........................</div>
+                <div style="margin-top:18px; display:flex; justify-content:space-between; align-items:center; border-top:1px solid #E2E8F0; padding-top:12px;">
+                    <div style="text-align:center;">
+                        <img src="{LedgerService.generate_qr_svg_data_uri(ZATCAPhase2Validator.validate_financial_document(voucher, settings=settings)['qr_code_base64'], size=95)}" width="95" height="95" style="border:1px solid #CBD5E1; padding:3px; border-radius:6px; background:white;"/>
+                        <p style="font-size:10px; color:#475569; margin:2px 0 0 0;">ZATCA Phase 2 TLV QR</p>
+                    </div>
+                    <div style="flex:1; margin-right:24px; display:flex; justify-content:space-between; font-size:13px;">
+                        <div><b>أمين الصندوق / الخزينة:</b> ........................</div>
+                        <div><b>المحاسب المختص:</b> ........................</div>
+                        <div><b>توقيع المستلم:</b> ........................</div>
+                    </div>
                 </div>
             </div>
         </body>
@@ -1176,3 +1189,16 @@ class PrintTemplateService:
         </body>
         </html>
         """
+
+    @staticmethod
+    def generate_immutable_audit_pdf(db: Session, **kwargs) -> bytes:
+        """توليد ملف PDF مؤمّن وغير قابل للتعديل لسجل التدقيق الرقابي للمراجع الخارجي"""
+        from zatca_audit_pdf import ZATCAAuditPDFExporter
+        return ZATCAAuditPDFExporter.generate_immutable_audit_pdf(db=db, **kwargs)
+
+    @staticmethod
+    def generate_audit_log_printable_html(db: Session, **kwargs) -> str:
+        """توليد قالب المعاينة والطباعة الرسمي لسجل التدقيق الرقابي للمراجع الخارجي"""
+        from zatca_audit_pdf import ZATCAAuditPDFExporter
+        return ZATCAAuditPDFExporter.generate_printable_audit_html(db=db, **kwargs)
+
