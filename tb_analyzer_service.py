@@ -389,8 +389,9 @@ class ExternalTBAnalyzerService:
     def generate_cpa_full_package(
         cls,
         classified_df: pd.DataFrame,
-        metadata: Dict[str, Any]
+        metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
+        metadata = metadata or {}
         label_to_key = {v: k for k, v in CPA_CATEGORIES.items()}
         df = classified_df.copy()
         for col_c in ["مدين مقارنة", "دائن مقارنة"]:
@@ -479,57 +480,75 @@ class ExternalTBAnalyzerService:
         ppe_accum = round(sum(i["balance"] for i in ppe_accum_items), 2)
         net_ppe = round(ppe_gross - ppe_accum, 2)
         comp_net_ppe = round(sum_cat(["PPE_COST"], "comp_balance") - sum_cat(["PPE_ACCUM_DEP"], "comp_balance"), 2)
+        op_ppe_gross = sum_cat(["PPE_COST"], "opening")
+        op_ppe_accum = sum_cat(["PPE_ACCUM_DEP"], "opening")
+        op_net_ppe = round(op_ppe_gross - op_ppe_accum, 2)
 
         intangibles = round(sum(i["balance"] for i in intang_items), 2)
+        op_intangibles = sum_cat(["INTANGIBLES"], "opening")
         total_non_current_assets = round(net_ppe + intangibles, 2)
         comp_non_current_assets = round(comp_net_ppe + sum_cat(["INTANGIBLES"], "comp_balance"), 2)
+        op_non_current_assets = round(op_net_ppe + op_intangibles, 2)
 
         cash_items = get_cat_accounts(["CASH_AND_BANKS"])
         total_cash = round(sum(i["balance"] for i in cash_items), 2)
         comp_cash = sum_cat(["CASH_AND_BANKS"], "comp_balance")
+        op_cash = sum_cat(["CASH_AND_BANKS"], "opening")
 
         ar_items = get_cat_accounts(["TRADE_RECEIVABLES"])
         allowance_items = get_cat_accounts(["ALLOWANCE_DOUBTFUL"])
         total_ar = round(sum(i["balance"] for i in ar_items) - sum(i["balance"] for i in allowance_items), 2)
         comp_ar = round(sum_cat(["TRADE_RECEIVABLES"], "comp_balance") - sum_cat(["ALLOWANCE_DOUBTFUL"], "comp_balance"), 2)
+        op_ar = round(sum_cat(["TRADE_RECEIVABLES"], "opening") - sum_cat(["ALLOWANCE_DOUBTFUL"], "opening"), 2)
 
         other_ar_items = get_cat_accounts(["OTHER_RECEIVABLES"])
         total_other_ar = round(sum(i["balance"] for i in other_ar_items), 2)
         comp_other_ar = sum_cat(["OTHER_RECEIVABLES"], "comp_balance")
+        op_other_ar = sum_cat(["OTHER_RECEIVABLES"], "opening")
 
         total_inventory = closing_inventory_tb
         comp_inventory = sum_cat(["INVENTORY"], "comp_balance")
         total_current_assets = round(total_cash + total_ar + total_other_ar + total_inventory, 2)
         comp_current_assets = round(comp_cash + comp_ar + comp_other_ar + comp_inventory, 2)
+        op_current_assets = round(op_cash + op_ar + op_other_ar + opening_inventory_tb, 2)
 
         total_assets = round(total_non_current_assets + total_current_assets, 2)
         comp_total_assets = round(comp_non_current_assets + comp_current_assets, 2)
+        op_total_assets = round(op_non_current_assets + op_current_assets, 2)
 
         ap_items = get_cat_accounts(["TRADE_PAYABLES"])
         total_ap = round(sum(i["balance"] for i in ap_items), 2)
         comp_ap = sum_cat(["TRADE_PAYABLES"], "comp_balance")
+        op_ap = sum_cat(["TRADE_PAYABLES"], "opening")
 
         other_ap_items = get_cat_accounts(["OTHER_PAYABLES"])
         total_other_ap = round(sum(i["balance"] for i in other_ap_items), 2)
         comp_other_ap = sum_cat(["OTHER_PAYABLES"], "comp_balance")
+        op_other_ap = sum_cat(["OTHER_PAYABLES"], "opening")
 
         rel_party_items = get_cat_accounts(["RELATED_PARTIES_CREDIT"])
         total_related_parties = round(sum(i["balance"] for i in rel_party_items), 2)
         comp_related_parties = sum_cat(["RELATED_PARTIES_CREDIT"], "comp_balance")
+        op_related_parties = sum_cat(["RELATED_PARTIES_CREDIT"], "opening")
 
         lt_liab_items = get_cat_accounts(["LONG_TERM_LIABILITIES"])
         total_non_current_liabilities = round(sum(i["balance"] for i in lt_liab_items), 2)
+        op_lt_liabilities = sum_cat(["LONG_TERM_LIABILITIES"], "opening")
 
         cap_items = get_cat_accounts(["CAPITAL"])
         capital = round(sum(i["balance"] for i in cap_items), 2)
+        op_capital = sum_cat(["CAPITAL"], "opening")
 
         res_items = get_cat_accounts(["STATUTORY_RESERVE"])
         statutory_reserve = round(sum(i["balance"] for i in res_items), 2)
+        op_statutory_reserve = sum_cat(["STATUTORY_RESERVE"], "opening")
 
         ret_items = get_cat_accounts(["RETAINED_EARNINGS"])
         opening_retained_earnings = round(sum(i["balance"] for i in ret_items), 2)
+        op_retained = sum_cat(["RETAINED_EARNINGS"], "opening")
 
         booked_zakat_prov = sum_cat(["ZAKAT_PROVISION"])
+        op_zakat_prov = sum_cat(["ZAKAT_PROVISION"], "opening")
         booked_zakat_exp = sum_cat(["ZAKAT_EXPENSE"])
 
         positive_sources = capital + statutory_reserve + total_related_parties + total_non_current_liabilities
@@ -560,16 +579,58 @@ class ExternalTBAnalyzerService:
         total_liabilities_and_equity = round(total_liabilities + total_equity, 2)
         bs_diff = round(total_assets - total_liabilities_and_equity, 2)
 
-        cf_before_wc = round(profit_before_zakat + depreciation_expense, 2)
-        cf_ar = -total_ar
-        cf_other_ar = -total_other_ar
-        cf_inv = -total_inventory
-        cf_ap = total_ap
-        cf_other_ap = total_other_ap
-        net_operating_cf = round(cf_before_wc + cf_ar + cf_other_ar + cf_inv + cf_ap + cf_other_ap, 2)
+        # التحقق من وجود مركز مالي افتتاحي متزن (أرصدة أول المدة) لحساب التغيرات الفعلية في التدفقات النقدية (IAS 7) وإيضاح الأصول (IAS 16)
+        op_total_liab_and_eq = round(
+            op_ap + op_other_ap + op_related_parties + op_lt_liabilities + op_capital + op_statutory_reserve + op_retained + op_zakat_prov, 2
+        )
+        has_opening_bs = (op_total_assets > 0.01) and (abs(op_total_assets - op_total_liab_and_eq) < 1.0)
 
-        net_investing_cf = round(-(ppe_gross + intangibles), 2)
-        net_financing_cf = round(total_related_parties + capital + statutory_reserve + total_non_current_liabilities + opening_retained_earnings, 2)
+        cf_before_wc = round(profit_before_zakat + depreciation_expense, 2)
+        if has_opening_bs:
+            ppe_opening_cost = op_ppe_gross
+            ppe_additions_cost = round(ppe_gross - op_ppe_gross, 2)
+            ppe_opening_dep = op_ppe_accum
+            ppe_additions_dep = round(ppe_accum - op_ppe_accum, 2)
+
+            cf_ar = round(-(total_ar - op_ar), 2)
+            cf_other_ar = round(-(total_other_ar - op_other_ar), 2)
+            cf_inv = round(-(total_inventory - opening_inventory_tb), 2)
+            cf_ap = round(total_ap - op_ap, 2)
+            cf_other_ap = round((total_other_ap + booked_zakat_prov - booked_zakat_exp) - (op_other_ap + op_zakat_prov), 2)
+            net_operating_cf = round(cf_before_wc + cf_ar + cf_other_ar + cf_inv + cf_ap + cf_other_ap, 2)
+
+            accum_dep_non_pnl_diff = round((ppe_accum - op_ppe_accum) - depreciation_expense, 2)
+            net_investing_cf = round(-((ppe_gross - op_ppe_gross) + (intangibles - op_intangibles) - accum_dep_non_pnl_diff), 2)
+
+            cf_rel_parties = round(total_related_parties - op_related_parties, 2)
+            cf_cap_change = round(
+                (capital + statutory_reserve + opening_retained_earnings + total_non_current_liabilities)
+                - (op_capital + op_statutory_reserve + op_retained + op_lt_liabilities),
+                2
+            )
+            net_financing_cf = round(cf_rel_parties + cf_cap_change, 2)
+            opening_cash_cf = op_cash
+        else:
+            ppe_opening_cost = 0.0
+            ppe_additions_cost = ppe_gross
+            ppe_opening_dep = 0.0
+            ppe_additions_dep = ppe_accum
+
+            cf_ar = -total_ar
+            cf_other_ar = -total_other_ar
+            cf_inv = -total_inventory
+            cf_ap = total_ap
+            cf_other_ap = round(total_other_ap + booked_zakat_prov - booked_zakat_exp, 2)
+            net_operating_cf = round(cf_before_wc + cf_ar + cf_other_ar + cf_inv + cf_ap + cf_other_ap, 2)
+
+            accum_dep_non_pnl_diff = round(ppe_accum - depreciation_expense, 2)
+            net_investing_cf = round(-(ppe_gross + intangibles - accum_dep_non_pnl_diff), 2)
+
+            cf_rel_parties = total_related_parties
+            cf_cap_change = round(capital + statutory_reserve + total_non_current_liabilities + opening_retained_earnings, 2)
+            net_financing_cf = round(cf_rel_parties + cf_cap_change, 2)
+            opening_cash_cf = 0.0
+
         net_cash_change = round(net_operating_cf + net_investing_cf + net_financing_cf, 2)
 
         has_comparative = bool(metadata.get("show_comparative", False)) or (comp_total_assets > 0 and comp_total_assets != capital)
@@ -673,22 +734,22 @@ class ExternalTBAnalyzerService:
                 "net_operating_cf": net_operating_cf,
                 "net_investing_cf": net_investing_cf,
                 "financing_details": {
-                    "due_to_related_parties": total_related_parties,
-                    "capital_change": capital + statutory_reserve + opening_retained_earnings + total_non_current_liabilities
+                    "due_to_related_parties": cf_rel_parties,
+                    "capital_change": cf_cap_change
                 },
                 "net_financing_cf": net_financing_cf,
                 "net_cash_change": net_cash_change,
-                "opening_cash": 0.0,
+                "opening_cash": opening_cash_cf,
                 "closing_cash": total_cash
             },
             "notes_details": {
                 "note_4_ppe": {
                     "items": ppe_cost_items,
-                    "opening_cost": 0.0,
-                    "additions_cost": ppe_gross,
+                    "opening_cost": ppe_opening_cost,
+                    "additions_cost": ppe_additions_cost,
                     "closing_cost": ppe_gross,
-                    "opening_dep": 0.0,
-                    "additions_dep": ppe_accum,
+                    "opening_dep": ppe_opening_dep,
+                    "additions_dep": ppe_additions_dep,
                     "closing_dep": ppe_accum,
                     "net_book_value": net_ppe
                 },

@@ -223,8 +223,12 @@ st.markdown("""
         text-align: right;
     }
 
-    [data-testid="stIconMaterial"], [class*="material-symbols"], [class*="material-icons"], .stExpander svg {
-        font-family: inherit !important;
+    [data-testid="stIconMaterial"], [class*="material-symbols"], [class*="material-icons"] {
+        font-family: "Material Symbols Rounded", "Material Icons" !important;
+        direction: ltr !important;
+    }
+
+    .stExpander svg {
         direction: ltr !important;
     }
 
@@ -330,7 +334,7 @@ with st.sidebar:
     selected_user_label = st.selectbox("المستخدم النشط:", list(user_map.keys()))
     active_user_info = user_map[selected_user_label]
 
-    enforce_pin = st.checkbox("🔐 طلب رمز الدخول السري (PIN) للمستخدم", value=True)
+    enforce_pin = st.checkbox("🔐 طلب رمز الدخول السري (PIN) للمستخدم", value=False)
     pin_verified = True
     if enforce_pin:
         entered_pin = st.text_input("أدخل رمز الدخول السري (PIN):", type="password", key=f"pin_in_{active_user_info['username']}")
@@ -587,7 +591,7 @@ elif menu_option == "📑 محلل ميزان المراجعة الخارجي و
             "custom_auditor_paragraph": custom_aud_para
         }
 
-        up_col1, up_col2, up_col3 = st.columns([2, 1.2, 1.2])
+        up_col1, up_col2, up_col3, up_col4 = st.columns([2, 1.1, 1.1, 1.1])
         with up_col1:
             uploaded_tb_file = st.file_uploader(
                 "📂 ارفع ملف ميزان المراجعة هنا (Excel `.xlsx` أو `.csv` بأي تخطيط أعمدة):",
@@ -595,18 +599,41 @@ elif menu_option == "📑 محلل ميزان المراجعة الخارجي و
             )
         with up_col2:
             st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("🧪 تحميل بيانات ميزان (مؤسسة تساهيل طيبة) للتجربة", use_container_width=True, type="primary"):
+            if st.button("🧪 تحميل ميزان (مؤسسة تساهيل طيبة)", use_container_width=True, type="primary"):
                 sample_raw = ExternalTBAnalyzerService.get_sample_tasaheel_tb_dataframe()
                 st.session_state["ext_tb_classified_df"] = ExternalTBAnalyzerService.normalize_and_classify_tb(sample_raw)
+                st.session_state["ext_tb_file_sig"] = "SAMPLE_TASAHEEL"
                 st.success("✅ تم تحميل وتبويب ميزان مراجعة (مؤسسة تساهيل طيبة التجارية) بنجاح!")
+                st.rerun()
         with up_col3:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("🔄 جلب ميزان دفاتر النظام الحية", use_container_width=True):
+                live_tb_raw = LedgerService.get_live_trial_balance(db, include_zero_balances=False)
+                if not live_tb_raw.empty:
+                    live_mapped = pd.DataFrame({
+                        "كود الحساب": live_tb_raw["Account Code"],
+                        "اسم الحساب": live_tb_raw["Account Name"],
+                        "مدين أول المدة": live_tb_raw["Opening Debit"],
+                        "دائن أول المدة": live_tb_raw["Opening Credit"],
+                        "حركة مدين": live_tb_raw["Period Debit"],
+                        "حركة دائن": live_tb_raw["Period Credit"],
+                        "مدين آخر المدة": live_tb_raw["Closing Debit"],
+                        "دائن آخر المدة": live_tb_raw["Closing Credit"],
+                    })
+                    st.session_state["ext_tb_classified_df"] = ExternalTBAnalyzerService.normalize_and_classify_tb(live_mapped)
+                    st.session_state["ext_tb_file_sig"] = "LIVE_LEDGER"
+                    st.success("✅ تم جلب وتبويب ميزان المراجعة الحي من دفاتر النظام!")
+                    st.rerun()
+                else:
+                    st.warning("لا توجد قيود مرحلة في الدفاتر الحية حالياً.")
+        with up_col4:
             st.markdown("<br>", unsafe_allow_html=True)
             sample_df_dl = ExternalTBAnalyzerService.get_sample_tasaheel_tb_dataframe()
             sample_buf = io.BytesIO()
             sample_df_dl.to_excel(sample_buf, index=False)
             sample_buf.seek(0)
             st.download_button(
-                "📥 تنزيل قالب ميزان مراجعة Excel جاهز",
+                "📥 تنزيل قالب Excel جاهز",
                 data=sample_buf,
                 file_name="Template_Trial_Balance_MizanPro.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -614,11 +641,14 @@ elif menu_option == "📑 محلل ميزان المراجعة الخارجي و
             )
 
         if uploaded_tb_file is not None:
-            try:
-                st.session_state["ext_tb_classified_df"] = ExternalTBAnalyzerService.parse_uploaded_trial_balance(uploaded_tb_file)
-                st.success(f"✅ تم قراءة وتصنيف ({len(st.session_state['ext_tb_classified_df'])}) حساباً من الملف المرفوع بنجاح!")
-            except Exception as e:
-                st.error(f"❌ تعذر قراءة الملف المرفوع: {str(e)}")
+            file_sig = f"{uploaded_tb_file.name}_{uploaded_tb_file.size}"
+            if st.session_state.get("ext_tb_file_sig") != file_sig:
+                try:
+                    st.session_state["ext_tb_classified_df"] = ExternalTBAnalyzerService.parse_uploaded_trial_balance(uploaded_tb_file)
+                    st.session_state["ext_tb_file_sig"] = file_sig
+                    st.success(f"✅ تم قراءة وتصنيف ({len(st.session_state['ext_tb_classified_df'])}) حساباً من الملف المرفوع بنجاح!")
+                except Exception as e:
+                    st.error(f"❌ تعذر قراءة الملف المرفوع: {str(e)}")
 
         if "ext_tb_classified_df" not in st.session_state:
             live_tb_raw = LedgerService.get_live_trial_balance(db, include_zero_balances=False)
@@ -681,9 +711,11 @@ elif menu_option == "📑 محلل ميزان المراجعة الخارجي و
                 },
                 use_container_width=True,
                 hide_index=True,
-                num_rows="dynamic"
+                num_rows="dynamic",
+                key="cpa_interactive_editor"
             )
-            active_tb_df = edited_df
+            st.session_state["ext_tb_classified_df"] = edited_df.copy()
+            active_tb_df = st.session_state["ext_tb_classified_df"]
 
         cpa_pkg = ExternalTBAnalyzerService.generate_cpa_full_package(active_tb_df, cpa_metadata)
         cpa_bs = cpa_pkg["balance_sheet"]
@@ -782,14 +814,22 @@ elif menu_option == "📑 محلل ميزان المراجعة الخارجي و
             st.table(pd.DataFrame(pnl_table))
 
         with tab_cf:
+            wc = cpa_cf["wc_changes"]
             cf_table = [
                 {"البيان": "صافي أرباح / (خسائر) الفترة قبل خصم الزكاة الشرعية", "ريال سعودي": f"{cpa_cf['profit_before_zakat']:,.0f}"},
-                {"البيان": "استهلاك العقارات وآلات ومعدات", "ريال سعودي": f"{cpa_cf['depreciation']:,.0f}"},
-                {"البيان": "صافي قبل التغيرات في رأس المال العامل", "ريال سعودي": f"{cpa_cf['profit_before_wc']:,.0f}"},
+                {"البيان": "تعديلات البنود غير النقدية: استهلاك العقارات وآلات ومعدات", "ريال سعودي": f"{cpa_cf['depreciation']:,.0f}"},
+                {"البيان": "صافي التدفقات قبل التغيرات في رأس المال العامل", "ريال سعودي": f"{cpa_cf['profit_before_wc']:,.0f}"},
+                {"البيان": "التغير في الذمم المدينة التجارية", "ريال سعودي": f"{wc['trade_receivables']:,.0f}"},
+                {"البيان": "التغير في الأرصدة المدينة الأخرى", "ريال سعودي": f"{wc['other_receivables']:,.0f}"},
+                {"البيان": "التغير في المخزون", "ريال سعودي": f"{wc['inventory']:,.0f}"},
+                {"البيان": "التغير في الذمم الدائنة التجارية", "ريال سعودي": f"{wc['trade_payables']:,.0f}"},
+                {"البيان": "التغير في الأرصدة الدائنة الأخرى", "ريال سعودي": f"{wc['other_payables']:,.0f}"},
                 {"البيان": "1️⃣ صافي التدفق النقدي من الأنشطة التشغيلية", "ريال سعودي": f"{cpa_cf['net_operating_cf']:,.0f}"},
-                {"البيان": "2️⃣ صافي التدفق النقدي من الأنشطة الاستثمارية", "ريال سعودي": f"{cpa_cf['net_investing_cf']:,.0f}"},
-                {"البيان": "3️⃣ صافي التدفق النقدي من الأنشطة التمويلية", "ريال سعودي": f"{cpa_cf['net_financing_cf']:,.0f}"},
-                {"البيان": "💰 رصيد النقد في آخر العام", "ريال سعودي": f"{cpa_cf['closing_cash']:,.0f}"},
+                {"البيان": "2️⃣ صافي التدفق النقدي من الأنشطة الاستثمارية (إضافات الأصول الثابتة)", "ريال سعودي": f"{cpa_cf['net_investing_cf']:,.0f}"},
+                {"البيان": "3️⃣ صافي التدفق النقدي من الأنشطة التمويلية (أطراف ذات علاقة ورأس المال)", "ريال سعودي": f"{cpa_cf['net_financing_cf']:,.0f}"},
+                {"البيان": "صافي التغير في النقد وما في حكمه خلال الفترة", "ريال سعودي": f"{cpa_cf['net_cash_change']:,.0f}"},
+                {"البيان": "رصيد النقد وما في حكمه في بداية الفترة", "ريال سعودي": f"{cpa_cf['opening_cash']:,.0f}"},
+                {"البيان": "💰 رصيد النقد وما في حكمه في نهاية الفترة", "ريال سعودي": f"{cpa_cf['closing_cash']:,.0f}"},
             ]
             st.table(pd.DataFrame(cf_table))
 
@@ -843,27 +883,53 @@ elif menu_option == "🏗️ الأصول الثابتة، الرواتب، وم
                 st.dataframe(fa_df, use_container_width=True, hide_index=True)
 
             st.divider()
-            col_dep1, col_dep2 = st.columns([1.2, 1])
+            col_dep1, col_dep2 = st.columns([1.25, 1])
             with col_dep1:
-                st.markdown("##### **➕ تسجيل أصل ثابت جديد في السجل:**")
-                fa_name = st.text_input("اسم ووصف الأصل الثابت:", placeholder="مثال: رافعة شوكية كهربائية للمستودع")
-                fa_cat = st.selectbox("فئة الأصل:", ["السيارات ووسائل النقل", "الآلات والمعدات والأجهزة", "المباني والإنشاءات", "الأثاث والتركيبات والتجهيزات"])
+                st.markdown("##### **➕ تسجيل أصل ثابت جديد أو تعديل أصل مسجل:**")
+                existing_assets = db.query(FixedAsset).order_by(FixedAsset.asset_code).all()
+                fa_choices = {"➕ إضافة أصل ثابت جديد": None}
+                for a_obj in existing_assets:
+                    fa_choices[f"✏️ تعديل الأصل: {a_obj.asset_code} - {a_obj.name_ar}"] = a_obj
+                sel_fa_obj = fa_choices[st.selectbox("اختر العملية أو الأصل المراد تعديله:", list(fa_choices.keys()))]
+
+                fa_cats = ["السيارات ووسائل النقل", "الآلات والمعدات والأجهزة", "المباني والإنشاءات", "الأثاث والتركيبات والتجهيزات"]
+                cat_idx = fa_cats.index(sel_fa_obj.category) if (sel_fa_obj and sel_fa_obj.category in fa_cats) else 0
+                fa_name = st.text_input("اسم ووصف الأصل الثابت:", value=sel_fa_obj.name_ar if sel_fa_obj else "", placeholder="مثال: رافعة شوكية كهربائية للمستودع")
+                fa_cat = st.selectbox("فئة الأصل:", fa_cats, index=cat_idx)
                 fa_c1, fa_c2, fa_c3 = st.columns(3)
                 with fa_c1:
-                    fa_cost = st.number_input("تكلفة الشراء (ريال):", min_value=0.0, step=1000.0)
+                    fa_cost = st.number_input("تكلفة الشراء (ريال):", min_value=0.0, value=float(sel_fa_obj.purchase_cost) if sel_fa_obj else 0.0, step=1000.0)
                 with fa_c2:
-                    fa_rate = st.number_input("نسبة الإهلاك السنوي (%):", min_value=1.0, max_value=100.0, value=20.0, step=5.0)
+                    fa_rate = st.number_input("نسبة الإهلاك السنوي (%):", min_value=1.0, max_value=100.0, value=float(sel_fa_obj.depreciation_rate * 100.0) if sel_fa_obj else 20.0, step=5.0)
                 with fa_c3:
-                    fa_dt = st.date_input("تاريخ الشراء:", value=date.today())
-                fa_post_je = st.checkbox("توليد قيد شراء الأصل الثابت آلياً في دفتر اليومية (خصماً من البنك)", value=True)
-                if st.button("💾 حفظ الأصل في السجل", type="primary", disabled=not has_perm("act_manage_assets")):
+                    fa_dt = st.date_input("تاريخ الشراء:", value=sel_fa_obj.purchase_date if sel_fa_obj else date.today())
+
+                fa_accum = st.number_input("مجمع الإهلاك المتراكم السابق (ريال):", min_value=0.0, value=float(sel_fa_obj.accumulated_depreciation) if sel_fa_obj else 0.0, step=500.0)
+                fa_active = st.checkbox("الأصل نشط وخاضع للإهلاك الدوري", value=sel_fa_obj.is_active if sel_fa_obj else True)
+
+                fa_post_je = False
+                fa_tr_code = "110201"
+                if not sel_fa_obj:
+                    fa_post_je = st.checkbox("توليد قيد شراء الأصل الثابت آلياً في دفتر اليومية", value=True)
+                    if fa_post_je:
+                        tr_accs = LedgerService.get_treasury_and_bank_accounts(db)
+                        tr_opts = {f"{a.code} - {a.name_ar}": a.code for a in tr_accs}
+                        tr_opts["210101 - الموردون التجاريون (شراء بالأجل)"] = "210101"
+                        fa_tr_code = tr_opts[st.selectbox("حساب السداد المقابل لقيد شراء الأصل:", list(tr_opts.keys()), key="fa_tr_acc")]
+
+                if st.button("💾 حفظ بيانات الأصل الثابت في السجل", type="primary", disabled=not has_perm("act_manage_assets")):
                     try:
                         LedgerService.create_or_update_fixed_asset(
                             db=db, name_ar=fa_name, category=fa_cat, purchase_date=fa_dt,
                             purchase_cost=fa_cost, depreciation_rate=fa_rate / 100.0,
-                            post_purchase_entry=fa_post_je
+                            accumulated_depreciation=fa_accum,
+                            asset_code=sel_fa_obj.asset_code if sel_fa_obj else None,
+                            post_purchase_entry=fa_post_je,
+                            treasury_account_code=fa_tr_code,
+                            is_active=fa_active,
+                            performed_by=get_active_user_label()
                         )
-                        st.success("✅ تم تسجيل الأصل الثابت بنجاح!")
+                        st.success("✅ تم حفظ وتحديث سجل الأصل الثابت بنجاح!")
                         st.rerun()
                     except Exception as e:
                         st.error(f"❌ {str(e)}")
@@ -875,7 +941,9 @@ elif menu_option == "🏗️ الأصول الثابتة، الرواتب، وم
                 dep_run_date = st.date_input("تاريخ قيد الإهلاك:", value=date.today(), key="dep_dt")
                 if st.button("🚀 احتساب وترحيل قيد إهلاك الأصول الثابتة الآن", type="primary", use_container_width=True, disabled=not has_perm("act_manage_assets")):
                     try:
-                        je_dep = LedgerService.run_period_depreciation(db=db, dep_date=dep_run_date, months=dep_months)
+                        je_dep = LedgerService.run_period_depreciation(
+                            db=db, dep_date=dep_run_date, months=dep_months, performed_by=get_active_user_label()
+                        )
                         st.success(f"🎉 تم ترحيل قيد الإهلاك الآلي برقم ({je_dep.entry_number}) بمبلغ إجمالي ({je_dep.total_debit:,.2f} ريال)!")
                         st.rerun()
                     except Exception as e:
@@ -891,33 +959,43 @@ elif menu_option == "🏗️ الأصول الثابتة، الرواتب، وم
                 st.dataframe(emp_df, use_container_width=True, hide_index=True)
 
             st.divider()
-            col_e1, col_e2 = st.columns([1.2, 1])
+            col_e1, col_e2 = st.columns([1.25, 1])
             with col_e1:
-                st.markdown("##### **➕ إضافة موظف جديد في سجل الرواتب:**")
-                e_name = st.text_input("اسم الموظف الكامل:")
-                e_job = st.text_input("المسمى الوظيفي:", value="محاسب")
+                st.markdown("##### **➕ إضافة موظف جديد أو تعديل بيانات موظف حالي:**")
+                all_emps = db.query(Employee).order_by(Employee.emp_code).all()
+                emp_choices = {"➕ إضافة موظف جديد": None}
+                for emp_o in all_emps:
+                    emp_choices[f"✏️ تعديل الموظف: {emp_o.emp_code} - {emp_o.name_ar} ({'نشط' if emp_o.is_active else 'موقوف'})"] = emp_o
+                sel_emp_obj = emp_choices[st.selectbox("اختر الموظف للتعديل أو أضف موظفاً جديداً:", list(emp_choices.keys()))]
+
+                e_name = st.text_input("اسم الموظف الكامل:", value=sel_emp_obj.name_ar if sel_emp_obj else "")
+                e_job = st.text_input("المسمى الوظيفي:", value=sel_emp_obj.job_title if sel_emp_obj else "محاسب")
                 ec1, ec2, ec3 = st.columns(3)
                 with ec1:
-                    e_nat = st.text_input("الجنسية:", value="سعودي")
+                    e_nat = st.text_input("الجنسية:", value=sel_emp_obj.nationality if sel_emp_obj else "سعودي")
                 with ec2:
-                    e_saudi = st.checkbox("خاضع لتأمينات السعوديين (GOSI)", value=True)
+                    e_saudi = st.checkbox("خاضع لتأمينات السعوديين (GOSI)", value=sel_emp_obj.is_saudi if sel_emp_obj else True)
                 with ec3:
-                    e_join = st.date_input("تاريخ المباشرة:", value=date(2024, 1, 1))
+                    e_join = st.date_input("تاريخ المباشرة:", value=sel_emp_obj.join_date if sel_emp_obj else date(2024, 1, 1))
                 es1, es2, es3 = st.columns(3)
                 with es1:
-                    e_basic = st.number_input("الراتب الأساسي:", min_value=0.0, value=6000.0, step=500.0)
+                    e_basic = st.number_input("الراتب الأساسي:", min_value=0.0, value=float(sel_emp_obj.basic_salary) if sel_emp_obj else 6000.0, step=500.0)
                 with es2:
-                    e_hous = st.number_input("بدل السكن:", min_value=0.0, value=1500.0, step=250.0)
+                    e_hous = st.number_input("بدل السكن:", min_value=0.0, value=float(sel_emp_obj.housing_allowance) if sel_emp_obj else 1500.0, step=250.0)
                 with es3:
-                    e_trans = st.number_input("بدل النقل:", min_value=0.0, value=500.0, step=100.0)
-                if st.button("💾 حفظ بيانات الموظف", disabled=not has_perm("act_manage_payroll")):
+                    e_trans = st.number_input("بدل النقل:", min_value=0.0, value=float(sel_emp_obj.transport_allowance) if sel_emp_obj else 500.0, step=100.0)
+                e_active = st.checkbox("الموظف على رأس العمل (نشط في المسير الشهري)", value=sel_emp_obj.is_active if sel_emp_obj else True)
+
+                if st.button("💾 حفظ بيانات الموظف", type="primary", disabled=not has_perm("act_manage_payroll")):
                     try:
                         LedgerService.create_or_update_employee(
                             db=db, name_ar=e_name, job_title=e_job, nationality=e_nat,
                             is_saudi=e_saudi, join_date=e_join, basic_salary=e_basic,
-                            housing_allowance=e_hous, transport_allowance=e_trans
+                            housing_allowance=e_hous, transport_allowance=e_trans,
+                            emp_code=sel_emp_obj.emp_code if sel_emp_obj else None,
+                            is_active=e_active, performed_by=get_active_user_label()
                         )
-                        st.success("✅ تم حفظ بيانات الموظف!")
+                        st.success("✅ تم حفظ وتحديث بيانات الموظف بنجاح!")
                         st.rerun()
                     except Exception as e:
                         st.error(f"❌ {str(e)}")
@@ -926,11 +1004,18 @@ elif menu_option == "🏗️ الأصول الثابتة، الرواتب، وم
                 st.markdown("##### **💸 إصدار وترحيل مسير الرواتب الشهري الجماعي:**")
                 pr_month = st.text_input("شهر المسير:", value=date.today().strftime("%Y-%m"))
                 pr_date = st.date_input("تاريخ صرف الرواتب:", value=date.today(), key="pr_dt")
+                tr_accs_pr = LedgerService.get_treasury_and_bank_accounts(db)
+                tr_pr_map = {f"{a.code} - {a.name_ar}": a.code for a in tr_accs_pr}
+                default_pr_idx = next((idx for idx, c in enumerate(tr_pr_map.values()) if c == "110201"), 0)
+                sel_pr_tr_code = tr_pr_map[st.selectbox("حساب البنك / الصندوق للصرف:", list(tr_pr_map.keys()), index=default_pr_idx, key="pr_tr")]
                 pr_inc_eos = st.checkbox("إثبات قسط مخصص مكافأة نهاية الخدمة الشهري آلياً في القيد", value=True)
                 if st.button("🚀 اعتماد وصرف مسير الرواتب وترحيل القيد المحاسبي", type="primary", use_container_width=True, disabled=not has_perm("act_manage_payroll")):
                     try:
+                        pr_pay_m = PaymentMethod.CASH if sel_pr_tr_code.startswith("1101") else PaymentMethod.BANK
                         pr_obj = LedgerService.process_monthly_payroll(
-                            db=db, period_month=pr_month, payment_date=pr_date, include_eos_accrual=pr_inc_eos
+                            db=db, period_month=pr_month, payment_date=pr_date,
+                            payment_method=pr_pay_m, treasury_account_code=sel_pr_tr_code,
+                            include_eos_accrual=pr_inc_eos, performed_by=get_active_user_label()
                         )
                         st.session_state["latest_payroll_id"] = pr_obj.id
                         st.success(f"🎉 تم اعتماد وصرف مسير الرواتب ({pr_obj.payroll_number}) بنجاح!")
@@ -945,7 +1030,19 @@ elif menu_option == "🏗️ الأصول الثابتة، الرواتب، وم
 
         with t_cc:
             st.markdown("##### **🎯 تقرير ربحية مراكز التكلفة والمشاريع والفروع:**")
-            cc_df = LedgerService.get_cost_centers_pnl(db)
+            cc_f1, cc_f2, cc_f3 = st.columns([1, 1, 1])
+            with cc_f1:
+                cc_use_dates = st.checkbox("تصفية ربحية المراكز بفترة زمنية محددة", value=False, key="cc_flt")
+            with cc_f2:
+                cc_start = st.date_input("من تاريخ:", value=date(settings.fiscal_year, 1, 1), disabled=not cc_use_dates, key="cc_sdt")
+            with cc_f3:
+                cc_end = st.date_input("إلى تاريخ:", value=date.today(), disabled=not cc_use_dates, key="cc_edt")
+
+            cc_df = LedgerService.get_cost_centers_pnl(
+                db,
+                start_date=cc_start if cc_use_dates else None,
+                end_date=cc_end if cc_use_dates else None
+            )
             if not cc_df.empty:
                 st.dataframe(cc_df, use_container_width=True, hide_index=True)
 
@@ -1004,12 +1101,20 @@ elif menu_option == "🛡️ الرقابة المالية: أعمار الدي�
 
         with t_bank:
             st.markdown("##### **🏦 مطابقة كشف الحساب البنكي مع دفتر الأستاذ (Bank Reconciliation):**")
-            up_bank = st.file_uploader("ارفع كشف حساب البنك (Excel/CSV) أو اتركه فارغاً لتشغيل المطابقة على الكشف النموذجي:", type=["xlsx", "csv"], key="bnk_up")
+            bank_accs = [a for a in LedgerService.get_treasury_and_bank_accounts(db) if a.code.startswith("1102")]
+            if not bank_accs:
+                bank_accs = LedgerService.get_treasury_and_bank_accounts(db)
+            bank_acc_map = {f"{a.code} - {a.name_ar}": a.code for a in bank_accs} or {"110201 - البنك الرئيسي": "110201"}
+            bnk_c1, bnk_c2 = st.columns([1, 1.5])
+            with bnk_c1:
+                sel_bnk_code = bank_acc_map[st.selectbox("اختر الحساب البنكي للمطابقة:", list(bank_acc_map.keys()), key="bnk_sel_acc")]
+            with bnk_c2:
+                up_bank = st.file_uploader("ارفع كشف حساب البنك (Excel/CSV) أو اتركه فارغاً لتشغيل المطابقة على الكشف النموذجي:", type=["xlsx", "csv"], key="bnk_up")
             uploaded_bank_df = None
             if up_bank is not None:
                 uploaded_bank_df = pd.read_csv(up_bank) if up_bank.name.endswith(".csv") else pd.read_excel(up_bank)
 
-            rec_res = LedgerService.reconcile_bank_statement(db, bank_account_code="110201", bank_df=uploaded_bank_df)
+            rec_res = LedgerService.reconcile_bank_statement(db, bank_account_code=sel_bnk_code, bank_df=uploaded_bank_df)
             b1, b2, b3, b4 = st.columns(4)
             b1.metric("رصيد البنك في الدفاتر", f"{rec_res['book_closing_balance']:,.2f} ريال")
             b2.metric("رصيد كشف البنك", f"{rec_res['bank_statement_balance']:,.2f} ريال")
@@ -1026,12 +1131,12 @@ elif menu_option == "🛡️ الرقابة المالية: أعمار الدي�
                         if net_unrec < 0:
                             adj_lines = [
                                 {"account_code": "5301", "debit": amt_abs, "credit": 0.0, "description": "عمولات ومصاريف بنكية"},
-                                {"account_code": "110201", "debit": 0.0, "credit": amt_abs, "description": "خصم من الحساب البنكي الجاري"}
+                                {"account_code": sel_bnk_code, "debit": 0.0, "credit": amt_abs, "description": "خصم من الحساب البنكي الجاري"}
                             ]
                             adj_desc = "إثبات رسوم وعمولات خدمات مصرفية من مذكرة التسوية البنكية"
                         else:
                             adj_lines = [
-                                {"account_code": "110201", "debit": amt_abs, "credit": 0.0, "description": "إيداع بنكي من مذكرة التسوية"},
+                                {"account_code": sel_bnk_code, "debit": amt_abs, "credit": 0.0, "description": "إيداع بنكي من مذكرة التسوية"},
                                 {"account_code": "4201", "debit": 0.0, "credit": amt_abs, "description": "إيرادات/تحصيلات بنكية مسواة"}
                             ]
                             adj_desc = "إثبات إيداعات بنكية غير مسجلة من مذكرة التسوية البنكية"
@@ -1054,7 +1159,9 @@ elif menu_option == "🛡️ الرقابة المالية: أعمار الدي�
                 cl_lock = st.checkbox("قفل الفترة المالية نهائياً بعد توليد قيد الإقفال (منع الترحيل إليها)", value=False)
                 if st.button("🚀 توليد وترحيل قيد إقفال السنة المالية الآن", type="primary", disabled=not has_perm("act_close_year")):
                     try:
-                        close_je = LedgerService.close_fiscal_year(db=db, fiscal_year=int(cl_year), lock_period=cl_lock)
+                        close_je = LedgerService.close_fiscal_year(
+                            db=db, fiscal_year=int(cl_year), lock_period=cl_lock, performed_by=get_active_user_label()
+                        )
                         st.success(f"🎉 تم إقفال حسابات قائمة الدخل بنجاح بموجب القيد رقم ({close_je.entry_number})!")
                     except Exception as e:
                         st.error(f"❌ {str(e)}")
@@ -1129,35 +1236,45 @@ elif menu_option == "📦 المخزون والعملاء والموردون":
                 st.dataframe(inv_df, use_container_width=True, hide_index=True)
 
             st.divider()
-            st.markdown("##### **➕ إضافة أو تحديث بطاقة صنف / خدمة:**")
+            st.markdown("##### **➕ إضافة بطاقة صنف جديد أو تعديل صنف مسجل:**")
+            all_prods = db.query(Product).order_by(Product.code).all()
+            prod_edit_choices = {"➕ إنشاء بطاقة صنف / خدمة جديدة": None}
+            for pr_o in all_prods:
+                prod_edit_choices[f"✏️ تعديل الصنف: {pr_o.code} - {pr_o.name_ar} ({'نشط' if pr_o.is_active else 'موقوف'})"] = pr_o
+            sel_prod_edit = prod_edit_choices[st.selectbox("اختر الصنف للتعديل أو أضف صنفاً جديداً:", list(prod_edit_choices.keys()))]
+
             p1, p2, p3, p4 = st.columns(4)
             with p1:
-                p_code = st.text_input("كود الصنف (اتركه فارغاً للتوليد الآلي):", placeholder="مثال: PRD-005")
+                p_code = st.text_input("كود الصنف (اتركه فارغاً للتوليد الآلي):", value=sel_prod_edit.code if sel_prod_edit else "", placeholder="مثال: PRD-005", disabled=bool(sel_prod_edit))
             with p2:
-                p_name = st.text_input("اسم الصنف / الخدمة (عربي):")
+                p_name = st.text_input("اسم الصنف / الخدمة (عربي):", value=sel_prod_edit.name_ar if sel_prod_edit else "")
             with p3:
-                p_cat = st.text_input("التصنيف:", value="قطع غيار")
+                p_cat = st.text_input("التصنيف:", value=(sel_prod_edit.category or "قطع غيار") if sel_prod_edit else "قطع غيار")
             with p4:
-                p_unit = st.selectbox("الوحدة:", ["حبة", "طقم", "كرتون", "لتر", "خدمة"])
+                units_list = ["حبة", "طقم", "كرتون", "لتر", "خدمة"]
+                u_idx = units_list.index(sel_prod_edit.unit) if (sel_prod_edit and sel_prod_edit.unit in units_list) else 0
+                p_unit = st.selectbox("الوحدة:", units_list, index=u_idx)
 
             p5, p6, p7, p8 = st.columns(4)
             with p5:
-                p_cost = st.number_input("التكلفة الافتراضية / المرجحة:", min_value=0.0, step=10.0)
+                p_cost = st.number_input("التكلفة الافتراضية / المرجحة:", min_value=0.0, value=float(sel_prod_edit.cost_price) if sel_prod_edit else 0.0, step=10.0)
             with p6:
-                p_sale = st.number_input("سعر البيع الافتراضي (بدون ضريبة):", min_value=0.0, step=10.0)
+                p_sale = st.number_input("سعر البيع الافتراضي (بدون ضريبة):", min_value=0.0, value=float(sel_prod_edit.sale_price) if sel_prod_edit else 0.0, step=10.0)
             with p7:
-                p_stock = st.number_input("رصيد أول المدة بالمخزن:", min_value=0.0, step=1.0)
+                p_stock = st.number_input("رصيد أول المدة بالمخزن:", min_value=0.0, value=float(sel_prod_edit.stock_quantity) if sel_prod_edit else 0.0, step=1.0, disabled=bool(sel_prod_edit))
             with p8:
-                p_is_srv = st.checkbox("صنف خدمي (غير مخزني)", value=False)
+                p_is_srv = st.checkbox("صنف خدمي (غير مخزني)", value=bool(sel_prod_edit.is_service) if sel_prod_edit else False)
+                p_active = st.checkbox("الصنف نشط ومتاح للتعامل", value=bool(sel_prod_edit.is_active) if sel_prod_edit else True)
 
             if st.button("💾 حفظ بطاقة الصنف", type="primary", disabled=not has_perm("act_manage_inventory")):
                 try:
                     prod = LedgerService.create_or_update_product(
-                        db=db, name_ar=p_name, code=p_code.strip() or None,
+                        db=db, name_ar=p_name, code=(sel_prod_edit.code if sel_prod_edit else (p_code.strip() or None)),
                         category=p_cat, unit=p_unit, cost_price=p_cost,
-                        sale_price=p_sale, stock_quantity=p_stock, is_service=p_is_srv
+                        sale_price=p_sale, stock_quantity=p_stock, is_service=p_is_srv,
+                        is_active=p_active, performed_by=get_active_user_label()
                     )
-                    st.success(f"✅ تم حفظ الصنف بنجاح برقم كود: {prod.code}")
+                    st.success(f"✅ تم حفظ وتحديث الصنف بنجاح برقم كود: {prod.code}")
                     st.rerun()
                 except Exception as e:
                     st.error(f"❌ خطأ: {str(e)}")
@@ -1249,7 +1366,8 @@ elif menu_option == "📦 المخزون والعملاء والموردون":
                         try:
                             LedgerService.create_inventory_adjustment(
                                 db=db, product_id=sel_prod.id,
-                                new_actual_quantity=actual_qty, adjustment_date=adj_date, reason=adj_reason
+                                new_actual_quantity=actual_qty, adjustment_date=adj_date, reason=adj_reason,
+                                performed_by=get_active_user_label()
                             )
                             st.success("✅ تمت التسوية الجردية وترحيل القيد المحاسبي بنجاح!")
                             st.rerun()
@@ -1257,60 +1375,98 @@ elif menu_option == "📦 المخزون والعملاء والموردون":
                             st.error(f"❌ خطأ: {str(e)}")
 
         with t_cust:
-            col_c1, col_c2 = st.columns([1, 1])
+            col_c1, col_c2 = st.columns([1, 1.2])
+            customers = db.query(Customer).order_by(Customer.id).all()
             with col_c1:
-                st.markdown("##### **➕ إضافة عميل جديد:**")
-                c_name = st.text_input("اسم العميل / الشركة:")
-                c_vat = st.text_input("الرقم الضريبي للعميل (15 رقماً للشركات):")
-                c_phone = st.text_input("رقم الجوال / الهاتف:")
-                c_addr = st.text_input("العنوان:")
-                c_lim = st.number_input("الحد الائتماني المسموح (ريال):", min_value=0.0, step=5000.0)
-                if st.button("💾 حفظ بيانات العميل", disabled=not has_perm("act_manage_inventory")):
+                st.markdown("##### **➕ إضافة عميل جديد أو تعديل عميل مسجل:**")
+                cust_edit_opts = {"➕ تسجيل عميل جديد": None}
+                for co in customers:
+                    cust_edit_opts[f"✏️ تعديل: {co.code} - {co.name_ar} ({'نشط' if co.is_active else 'موقوف'})"] = co
+                sel_c_edit = cust_edit_opts[st.selectbox("اختر العميل للتعديل أو أضف جديداً:", list(cust_edit_opts.keys()))]
+
+                c_name = st.text_input("اسم العميل / الشركة:", value=sel_c_edit.name_ar if sel_c_edit else "")
+                c_vat = st.text_input("الرقم الضريبي للعميل (15 رقماً للشركات):", value=(sel_c_edit.vat_number or "") if sel_c_edit else "")
+                c_phone = st.text_input("رقم الجوال / الهاتف:", value=(sel_c_edit.phone or "") if sel_c_edit else "")
+                c_addr = st.text_input("العنوان:", value=(sel_c_edit.address or "") if sel_c_edit else "")
+                c_lim = st.number_input("الحد الائتماني المسموح (ريال):", min_value=0.0, value=float(sel_c_edit.credit_limit or 0.0) if sel_c_edit else 0.0, step=5000.0)
+                c_active = st.checkbox("حساب العميل نشط", value=bool(sel_c_edit.is_active) if sel_c_edit else True)
+                if st.button("💾 حفظ بيانات العميل", type="primary", disabled=not has_perm("act_manage_inventory")):
                     try:
                         c_obj = LedgerService.create_or_update_customer(
-                            db=db, name_ar=c_name, vat_number=c_vat, phone=c_phone, address=c_addr, credit_limit=c_lim
+                            db=db, name_ar=c_name, code=sel_c_edit.code if sel_c_edit else None,
+                            vat_number=c_vat, phone=c_phone, address=c_addr, credit_limit=c_lim,
+                            is_active=c_active, performed_by=get_active_user_label()
                         )
-                        st.success(f"✅ تم حفظ العميل برقم: {c_obj.code}")
+                        st.success(f"✅ تم حفظ وتحديث بيانات العميل برقم: {c_obj.code}")
                         st.rerun()
                     except Exception as e:
                         st.error(f"❌ {str(e)}")
 
             with col_c2:
                 st.markdown("##### **📑 كشف حساب عميل تفصيلي:**")
-                customers = db.query(Customer).order_by(Customer.id).all()
                 if customers:
                     c_map = {f"{c.code} - {c.name_ar}": c.id for c in customers}
-                    sel_c = st.selectbox("اختر العميل:", list(c_map.keys()))
-                    c_stmt = LedgerService.get_party_statement(db, "CUSTOMER", c_map[sel_c])
+                    sel_c = st.selectbox("اختر العميل لعرض كشف حسابه:", list(c_map.keys()))
+                    cf_c1, cf_c2, cf_c3 = st.columns([1, 1, 1])
+                    with cf_c1:
+                        c_use_dt = st.checkbox("تصفية بالتاريخ", value=False, key="c_stmt_flt")
+                    with cf_c2:
+                        c_sdt = st.date_input("من تاريخ:", value=date(date.today().year, 1, 1), disabled=not c_use_dt, key="c_sdt")
+                    with cf_c3:
+                        c_edt = st.date_input("إلى تاريخ:", value=date.today(), disabled=not c_use_dt, key="c_edt")
+                    c_stmt = LedgerService.get_party_statement(
+                        db, "CUSTOMER", c_map[sel_c],
+                        start_date=c_sdt if c_use_dt else None,
+                        end_date=c_edt if c_use_dt else None
+                    )
                     st.metric("الرصيد المستحق على العميل", f"{c_stmt['net_balance']:,.2f} ريال")
                     if c_stmt["statement"]:
                         st.dataframe(pd.DataFrame(c_stmt["statement"]), use_container_width=True, hide_index=True)
 
         with t_supp:
-            col_s1, col_s2 = st.columns([1, 1])
+            col_s1, col_s2 = st.columns([1, 1.2])
+            suppliers = db.query(Supplier).order_by(Supplier.id).all()
             with col_s1:
-                st.markdown("##### **➕ إضافة مورد جديد:**")
-                s_name = st.text_input("اسم المورد / الشركة الموردة:")
-                s_vat = st.text_input("الرقم الضريبي للمورد:")
-                s_phone = st.text_input("هاتف المورد:")
-                s_addr = st.text_input("عنوان المورد:")
-                if st.button("💾 حفظ بيانات المورد", disabled=not has_perm("act_manage_inventory")):
+                st.markdown("##### **➕ إضافة مورد جديد أو تعديل مورد مسجل:**")
+                supp_edit_opts = {"➕ تسجيل مورد جديد": None}
+                for so in suppliers:
+                    supp_edit_opts[f"✏️ تعديل: {so.code} - {so.name_ar} ({'نشط' if so.is_active else 'موقوف'})"] = so
+                sel_s_edit = supp_edit_opts[st.selectbox("اختر المورد للتعديل أو أضف جديداً:", list(supp_edit_opts.keys()))]
+
+                s_name = st.text_input("اسم المورد / الشركة الموردة:", value=sel_s_edit.name_ar if sel_s_edit else "")
+                s_vat = st.text_input("الرقم الضريبي للمورد:", value=(sel_s_edit.vat_number or "") if sel_s_edit else "")
+                s_phone = st.text_input("هاتف المورد:", value=(sel_s_edit.phone or "") if sel_s_edit else "")
+                s_addr = st.text_input("عنوان المورد:", value=(sel_s_edit.address or "") if sel_s_edit else "")
+                s_active = st.checkbox("حساب المورد نشط", value=bool(sel_s_edit.is_active) if sel_s_edit else True)
+                if st.button("💾 حفظ بيانات المورد", type="primary", disabled=not has_perm("act_manage_inventory")):
                     try:
                         s_obj = LedgerService.create_or_update_supplier(
-                            db=db, name_ar=s_name, vat_number=s_vat, phone=s_phone, address=s_addr
+                            db=db, name_ar=s_name, code=sel_s_edit.code if sel_s_edit else None,
+                            vat_number=s_vat, phone=s_phone, address=s_addr,
+                            is_active=s_active, performed_by=get_active_user_label()
                         )
-                        st.success(f"✅ تم حفظ المورد برقم: {s_obj.code}")
+                        st.success(f"✅ تم حفظ وتحديث بيانات المورد برقم: {s_obj.code}")
                         st.rerun()
                     except Exception as e:
                         st.error(f"❌ {str(e)}")
 
             with col_s2:
                 st.markdown("##### **📑 كشف حساب مورد تفصيلي:**")
-                suppliers = db.query(Supplier).order_by(Supplier.id).all()
                 if suppliers:
                     s_map = {f"{s.code} - {s.name_ar}": s.id for s in suppliers}
-                    sel_s = st.selectbox("اختر المورد:", list(s_map.keys()))
-                    s_stmt = LedgerService.get_party_statement(db, "SUPPLIER", s_map[sel_s])
+                    sel_s = st.selectbox("اختر المورد لعرض كشف حسابه:", list(s_map.keys()))
+                    sf_c1, sf_c2, sf_c3 = st.columns([1, 1, 1])
+                    with sf_c1:
+                        s_use_dt = st.checkbox("تصفية بالتاريخ", value=False, key="s_stmt_flt")
+                    with sf_c2:
+                        s_sdt = st.date_input("من تاريخ:", value=date(date.today().year, 1, 1), disabled=not s_use_dt, key="s_sdt")
+                    with sf_c3:
+                        s_edt = st.date_input("إلى تاريخ:", value=date.today(), disabled=not s_use_dt, key="s_edt")
+                    s_stmt = LedgerService.get_party_statement(
+                        db, "SUPPLIER", s_map[sel_s],
+                        start_date=s_sdt if s_use_dt else None,
+                        end_date=s_edt if s_use_dt else None
+                    )
                     st.metric("الرصيد المستحق للمورد", f"{s_stmt['net_balance']:,.2f} ريال")
                     if s_stmt["statement"]:
                         st.dataframe(pd.DataFrame(s_stmt["statement"]), use_container_width=True, hide_index=True)
@@ -1339,11 +1495,30 @@ elif menu_option == "🧾 المبيعات وإشعارات الدائن":
         for cc in cost_centers:
             cc_choices[f"{cc.code} - {cc.name_ar}"] = cc.id
 
-        pay_method_map = {
-            "نقداً (الصندوق الرئيسي)": PaymentMethod.CASH,
-            "تحويل بنكي / شبكة (POS)": PaymentMethod.BANK,
-            "بالأجل (على حساب العميل)": PaymentMethod.CREDIT
-        }
+        tr_accounts = LedgerService.get_treasury_and_bank_accounts(db)
+        pay_method_map = {}
+        pay_treasury_code_map = {}
+        for tr_a in tr_accounts:
+            if tr_a.code.startswith("1101"):
+                lbl = f"نقداً ({tr_a.name_ar} - {tr_a.code})"
+                pay_method_map[lbl] = PaymentMethod.CASH
+                pay_treasury_code_map[lbl] = tr_a.code
+            else:
+                lbl = f"تحويل بنكي / شبكة ({tr_a.name_ar} - {tr_a.code})"
+                pay_method_map[lbl] = PaymentMethod.BANK
+                pay_treasury_code_map[lbl] = tr_a.code
+        if not pay_method_map:
+            pay_method_map = {
+                "نقداً (الصندوق الرئيسي)": PaymentMethod.CASH,
+                "تحويل بنكي / شبكة (POS)": PaymentMethod.BANK,
+            }
+            pay_treasury_code_map = {
+                "نقداً (الصندوق الرئيسي)": "110101",
+                "تحويل بنكي / شبكة (POS)": "110201",
+            }
+        pay_method_map["بالأجل (على حساب العميل)"] = PaymentMethod.CREDIT
+        pay_treasury_code_map["بالأجل (على حساب العميل)"] = None
+
         inv_type_map = {
             "فاتورة ضريبية مبسطة (B2C)": InvoiceType.SIMPLIFIED,
             "فاتورة ضريبية قياسية (B2B)": InvoiceType.STANDARD
@@ -1371,8 +1546,9 @@ elif menu_option == "🧾 المبيعات وإشعارات الدائن":
 
             f4, f5, f6 = st.columns(3)
             with f4:
-                selected_pay_label = st.selectbox("طريقة السداد:", list(pay_method_map.keys()))
+                selected_pay_label = st.selectbox("طريقة السداد وحساب التحصيل:", list(pay_method_map.keys()))
                 pay_method = pay_method_map[selected_pay_label]
+                sel_tr_code_sales = pay_treasury_code_map[selected_pay_label]
             with f5:
                 selected_inv_label = st.selectbox("نوع الفاتورة الضريبية:", list(inv_type_map.keys()))
                 inv_type = inv_type_map[selected_inv_label]
@@ -1454,7 +1630,9 @@ elif menu_option == "🧾 المبيعات وإشعارات الدائن":
                         cost_center_id=sel_cc_s, items_data=invoice_items_list,
                         invoice_date=inv_date, payment_method=pay_method,
                         invoice_type=inv_type, customer_vat_number=cust_vat, notes=inv_notes,
-                        allow_negative_stock=allow_neg_sale, performed_by=get_active_user_label()
+                        allow_negative_stock=allow_neg_sale,
+                        treasury_account_code=sel_tr_code_sales,
+                        performed_by=get_active_user_label()
                     )
                     st.session_state["latest_invoice_id"] = new_inv.id
                     st.success(f"🎉 تم إصدار الفاتورة الضريبية بنجاح برقم: {new_inv.invoice_number}")
@@ -1481,15 +1659,57 @@ elif menu_option == "🧾 المبيعات وإشعارات الدائن":
             with cn3:
                 cn_reason = st.text_input("سبب إصدار الإشعار الدائن:", value="مرتجع بضاعة طبقاً للاتفاق")
 
-            cn4, cn5, cn6, cn7 = st.columns(4)
-            with cn4:
-                cn_prod = prod_choices[st.selectbox("الصنف المرتجع:", list(prod_choices.keys()), key="cn_pk")]
-            with cn5:
-                cn_item_name = st.text_input("وصف البند المرتجع:", value=cn_prod.name_ar if cn_prod else "بند مرتجع مبيعات")
-            with cn6:
-                cn_qty = st.number_input("الكمية المرتجعة:", min_value=1.0, value=1.0, step=1.0)
-            with cn7:
-                cn_price = st.number_input("سعر الوحدة المرتجعة:", min_value=0.0, value=float(cn_prod.sale_price) if cn_prod else 100.0, step=10.0)
+            if "cn_items_count" not in st.session_state:
+                st.session_state.cn_items_count = 1
+
+            cn_b1, cn_b2, cn_b3 = st.columns(3)
+            with cn_b1:
+                if st.button("➕ إضافة سطر صنف مرتجع مبيعات"):
+                    st.session_state.cn_items_count += 1
+                    st.rerun()
+            with cn_b2:
+                if st.session_state.cn_items_count > 1 and st.button("➖ حذف آخر سطر مرتجع مبيعات"):
+                    st.session_state.cn_items_count -= 1
+                    st.rerun()
+            with cn_b3:
+                if orig_inv and orig_inv.items and st.button("📥 جلب كافة أصناف الفاتورة الأصلية تلقائياً"):
+                    st.session_state.cn_items_count = len(orig_inv.items)
+                    st.session_state["cn_prefill_inv_id"] = orig_inv.id
+                    st.rerun()
+
+            cn_items_list = []
+            orig_items_list = list(orig_inv.items) if (orig_inv and orig_inv.items) else []
+            prod_by_id = {p.id: p for p in products}
+            prod_key_by_id = {p.id: k for k, p in prod_choices.items() if p is not None}
+
+            for idx_cn in range(st.session_state.cn_items_count):
+                prefill_it = orig_items_list[idx_cn] if idx_cn < len(orig_items_list) else None
+                default_pk_idx = 0
+                if prefill_it and prefill_it.product_id in prod_key_by_id:
+                    default_pk_idx = list(prod_choices.keys()).index(prod_key_by_id[prefill_it.product_id])
+
+                cn4, cn5, cn6, cn7 = st.columns([2, 2, 1, 1.2])
+                with cn4:
+                    cn_prod = prod_choices[st.selectbox(f"الصنف المرتجع #{idx_cn+1}:", list(prod_choices.keys()), index=default_pk_idx, key=f"cn_pk_{idx_cn}")]
+                with cn5:
+                    default_iname = prefill_it.item_name if prefill_it else (cn_prod.name_ar if cn_prod else f"بند مرتجع مبيعات #{idx_cn+1}")
+                    cn_item_name = st.text_input("وصف البند المرتجع:", value=default_iname, key=f"cn_inm_{idx_cn}")
+                with cn6:
+                    default_qty = float(prefill_it.quantity) if prefill_it else 1.0
+                    cn_qty = st.number_input("الكمية المرتجعة:", min_value=1.0, value=default_qty, step=1.0, key=f"cn_qty_{idx_cn}")
+                with cn7:
+                    default_pr = float(prefill_it.unit_price) if prefill_it else (float(cn_prod.sale_price) if cn_prod else 100.0)
+                    cn_price = st.number_input("سعر الوحدة المرتجعة:", min_value=0.0, value=default_pr, step=10.0, key=f"cn_pr_{idx_cn}")
+
+                if cn_price > 0:
+                    cn_items_list.append({
+                        "product_id": cn_prod.id if cn_prod else (prefill_it.product_id if prefill_it else None),
+                        "item_name": cn_item_name,
+                        "quantity": cn_qty,
+                        "unit_price": cn_price,
+                        "cost_price": float(cn_prod.cost_price) if cn_prod else (float(prefill_it.cost_price) if prefill_it else 0.0),
+                        "tax_rate": float(cn_prod.tax_rate) if cn_prod else float(settings.default_vat_rate)
+                    })
 
             cn_pay_label = st.selectbox("طريقة تسوية الإشعار الدائن:", list(pay_method_map.keys()), key="cn_pay")
 
@@ -1501,12 +1721,11 @@ elif menu_option == "🧾 المبيعات وإشعارات الدائن":
                         original_invoice_number=orig_inv.invoice_number if orig_inv else None,
                         sales_invoice_id=orig_inv.id if orig_inv else None,
                         customer_id=orig_inv.customer_id if orig_inv else None,
-                        payment_method=pay_method_map[cn_pay_label], reason=cn_reason,
-                        items_data=[{
-                            "product_id": cn_prod.id if cn_prod else None, "item_name": cn_item_name,
-                            "quantity": cn_qty, "unit_price": cn_price,
-                            "cost_price": cn_prod.cost_price if cn_prod else 0.0, "tax_rate": float(cn_prod.tax_rate) if cn_prod else float(settings.default_vat_rate)
-                        }]
+                        payment_method=pay_method_map[cn_pay_label],
+                        treasury_account_code=pay_treasury_code_map[cn_pay_label],
+                        reason=cn_reason,
+                        items_data=cn_items_list,
+                        performed_by=get_active_user_label()
                     )
                     st.session_state["latest_cn_id"] = cn_obj.id
                     st.success(f"✅ تم إصدار الإشعار الدائن برقم: {cn_obj.note_number}")
@@ -1551,11 +1770,19 @@ elif menu_option == "📥 المشتريات وإشعارات المدين":
         for cc in cost_centers:
             cc_choices[f"{cc.code} - {cc.name_ar}"] = cc.id
 
-        pay_method_map = {
-            "بالأجل (على حساب المورد)": PaymentMethod.CREDIT,
-            "تحويل بنكي من حساب الشركة": PaymentMethod.BANK,
-            "نقداً من الصندوق الرئيسي": PaymentMethod.CASH
-        }
+        tr_accounts_p = LedgerService.get_treasury_and_bank_accounts(db)
+        pay_method_map = {"بالأجل (على حساب المورد)": PaymentMethod.CREDIT}
+        pay_treasury_code_map_p = {"بالأجل (على حساب المورد)": None}
+        for tr_a in tr_accounts_p:
+            if tr_a.code.startswith("1101"):
+                lbl = f"نقداً ({tr_a.name_ar} - {tr_a.code})"
+                pay_method_map[lbl] = PaymentMethod.CASH
+                pay_treasury_code_map_p[lbl] = tr_a.code
+            else:
+                lbl = f"تحويل بنكي ({tr_a.name_ar} - {tr_a.code})"
+                pay_method_map[lbl] = PaymentMethod.BANK
+                pay_treasury_code_map_p[lbl] = tr_a.code
+
         prod_choices = {"-- صنف حر / يدوي --": None}
         for p in products:
             prod_choices[f"{p.code} - {p.name_ar} (الرصيد: {p.stock_quantity:,.0f} | WAC: {p.cost_price:,.2f})"] = p
@@ -1579,7 +1806,9 @@ elif menu_option == "📥 المشتريات وإشعارات المدين":
             with p4:
                 pur_date = st.date_input("تاريخ فاتورة الشراء:", value=date.today())
             with p5:
-                pur_pay_method = pay_method_map[st.selectbox("طريقة السداد للمورد:", list(pay_method_map.keys()))]
+                sel_pur_pay_lbl = st.selectbox("طريقة السداد للمورد:", list(pay_method_map.keys()))
+                pur_pay_method = pay_method_map[sel_pur_pay_lbl]
+                sel_tr_code_pur = pay_treasury_code_map_p[sel_pur_pay_lbl]
             with p6:
                 sel_cc_p = cc_choices[st.selectbox("مركز التكلفة / المشروع:", list(cc_choices.keys()), key="p_cc")]
 
@@ -1622,7 +1851,9 @@ elif menu_option == "📥 المشتريات وإشعارات المدين":
                     new_pur = LedgerService.create_purchase_invoice(
                         db=db, supplier_name=supp_name, supplier_id=sel_supp.id if sel_supp else None,
                         cost_center_id=sel_cc_p, items_data=purchase_items_list, invoice_date=pur_date,
-                        payment_method=pur_pay_method, supplier_vat_number=supp_vat, supplier_invoice_number=supp_inv_no
+                        payment_method=pur_pay_method, supplier_vat_number=supp_vat,
+                        supplier_invoice_number=supp_inv_no, treasury_account_code=sel_tr_code_pur,
+                        performed_by=get_active_user_label()
                     )
                     st.session_state["latest_purchase_id"] = new_pur.id
                     st.success(f"🎉 تم تسجيل فاتورة المشتريات برقم: {new_pur.invoice_number}")
@@ -1643,15 +1874,55 @@ elif menu_option == "📥 المشتريات وإشعارات المدين":
             with dn3:
                 dn_reason = st.text_input("سبب إصدار الإشعار المدين:", value="رد بضاعة غير مطابقة للمواصفات للمورد")
 
-            dn4, dn5, dn6, dn7 = st.columns(4)
-            with dn4:
-                dn_prod = prod_choices[st.selectbox("الصنف المرتجع للمورد:", list(prod_choices.keys()), key="dn_pk")]
-            with dn5:
-                dn_item_name = st.text_input("وصف البند المرتجع:", value=dn_prod.name_ar if dn_prod else "بند مرتجع مشتريات", key="dn_iname")
-            with dn6:
-                dn_qty = st.number_input("الكمية المرتجعة للمورد:", min_value=1.0, value=1.0, step=1.0, key="dn_qty")
-            with dn7:
-                dn_price = st.number_input("سعر الشراء للوحدة المرتجعة:", min_value=0.0, value=float(dn_prod.cost_price) if dn_prod else 100.0, step=10.0, key="dn_pr")
+            if "dn_items_count" not in st.session_state:
+                st.session_state.dn_items_count = 1
+
+            dn_b1, dn_b2, dn_b3 = st.columns(3)
+            with dn_b1:
+                if st.button("➕ إضافة سطر صنف مرتجع مشتريات"):
+                    st.session_state.dn_items_count += 1
+                    st.rerun()
+            with dn_b2:
+                if st.session_state.dn_items_count > 1 and st.button("➖ حذف آخر سطر مرتجع مشتريات"):
+                    st.session_state.dn_items_count -= 1
+                    st.rerun()
+            with dn_b3:
+                if orig_pinv and orig_pinv.items and st.button("📥 جلب كافة أصناف فاتورة الشراء الأصلية تلقائياً"):
+                    st.session_state.dn_items_count = len(orig_pinv.items)
+                    st.rerun()
+
+            dn_items_list = []
+            orig_pitems_list = list(orig_pinv.items) if (orig_pinv and orig_pinv.items) else []
+            prod_key_by_id_p = {p.id: k for k, p in prod_choices.items() if p is not None}
+
+            for idx_dn in range(st.session_state.dn_items_count):
+                prefill_pit = orig_pitems_list[idx_dn] if idx_dn < len(orig_pitems_list) else None
+                default_dpk_idx = 0
+                if prefill_pit and prefill_pit.product_id in prod_key_by_id_p:
+                    default_dpk_idx = list(prod_choices.keys()).index(prod_key_by_id_p[prefill_pit.product_id])
+
+                dn4, dn5, dn6, dn7 = st.columns([2, 2, 1, 1.2])
+                with dn4:
+                    dn_prod = prod_choices[st.selectbox(f"الصنف المرتجع للمورد #{idx_dn+1}:", list(prod_choices.keys()), index=default_dpk_idx, key=f"dn_pk_{idx_dn}")]
+                with dn5:
+                    def_dname = prefill_pit.item_name if prefill_pit else (dn_prod.name_ar if dn_prod else f"بند مرتجع مشتريات #{idx_dn+1}")
+                    dn_item_name = st.text_input("وصف البند المرتجع:", value=def_dname, key=f"dn_iname_{idx_dn}")
+                with dn6:
+                    def_dqty = float(prefill_pit.quantity) if prefill_pit else 1.0
+                    dn_qty = st.number_input("الكمية المرتجعة للمورد:", min_value=1.0, value=def_dqty, step=1.0, key=f"dn_qty_{idx_dn}")
+                with dn7:
+                    def_dpr = float(prefill_pit.unit_price) if prefill_pit else (float(dn_prod.cost_price) if dn_prod else 100.0)
+                    dn_price = st.number_input("سعر الشراء للوحدة المرتجعة:", min_value=0.0, value=def_dpr, step=10.0, key=f"dn_pr_{idx_dn}")
+
+                if dn_price > 0:
+                    dn_items_list.append({
+                        "product_id": dn_prod.id if dn_prod else (prefill_pit.product_id if prefill_pit else None),
+                        "item_name": dn_item_name,
+                        "quantity": dn_qty,
+                        "unit_price": dn_price,
+                        "cost_price": float(dn_prod.cost_price) if dn_prod else dn_price,
+                        "tax_rate": float(dn_prod.tax_rate) if dn_prod else float(settings.default_vat_rate)
+                    })
 
             dn_pay_label = st.selectbox("طريقة تسوية الإشعار المدين مع المورد:", list(pay_method_map.keys()), key="dn_pay")
 
@@ -1663,12 +1934,11 @@ elif menu_option == "📥 المشتريات وإشعارات المدين":
                         original_invoice_number=orig_pinv.invoice_number if orig_pinv else None,
                         purchase_invoice_id=orig_pinv.id if orig_pinv else None,
                         supplier_id=orig_pinv.supplier_id if orig_pinv else None,
-                        payment_method=pay_method_map[dn_pay_label], reason=dn_reason,
-                        items_data=[{
-                            "product_id": dn_prod.id if dn_prod else None, "item_name": dn_item_name,
-                            "quantity": dn_qty, "unit_price": dn_price,
-                            "cost_price": dn_prod.cost_price if dn_prod else dn_price, "tax_rate": float(dn_prod.tax_rate) if dn_prod else float(settings.default_vat_rate)
-                        }]
+                        payment_method=pay_method_map[dn_pay_label],
+                        treasury_account_code=pay_treasury_code_map_p[dn_pay_label],
+                        reason=dn_reason,
+                        items_data=dn_items_list,
+                        performed_by=get_active_user_label()
                     )
                     st.session_state["latest_dn_id"] = dn_obj.id
                     st.success(f"✅ تم إصدار الإشعار المدين (مرتجع المشتريات) برقم: {dn_obj.note_number}")
@@ -1715,10 +1985,27 @@ elif menu_option == "💸 سندات القبض والصرف (الخزينة)":
         for cc in cost_centers:
             cc_choices[f"{cc.code} - {cc.name_ar}"] = cc.id
 
-        pay_map = {
-            "نقداً (الصندوق الرئيسي - 110101)": PaymentMethod.CASH,
-            "تحويل بنكي / شبكة (البنك الرئيسي - 110201)": PaymentMethod.BANK
-        }
+        tr_accounts_v = LedgerService.get_treasury_and_bank_accounts(db)
+        pay_map = {}
+        pay_tr_code_map = {}
+        for tr_a in tr_accounts_v:
+            if tr_a.code.startswith("1101"):
+                lbl = f"نقداً ({tr_a.name_ar} - {tr_a.code})"
+                pay_map[lbl] = PaymentMethod.CASH
+                pay_tr_code_map[lbl] = tr_a.code
+            else:
+                lbl = f"تحويل بنكي / شبكة ({tr_a.name_ar} - {tr_a.code})"
+                pay_map[lbl] = PaymentMethod.BANK
+                pay_tr_code_map[lbl] = tr_a.code
+        if not pay_map:
+            pay_map = {
+                "نقداً (الصندوق الرئيسي - 110101)": PaymentMethod.CASH,
+                "تحويل بنكي / شبكة (البنك الرئيسي - 110201)": PaymentMethod.BANK
+            }
+            pay_tr_code_map = {
+                "نقداً (الصندوق الرئيسي - 110101)": "110101",
+                "تحويل بنكي / شبكة (البنك الرئيسي - 110201)": "110201"
+            }
 
         with t_rv:
             r1, r2, r3 = st.columns(3)
@@ -1726,7 +2013,7 @@ elif menu_option == "💸 سندات القبض والصرف (الخزينة)":
                 rv_party_type_lbl = st.selectbox("نوع جهة السداد:", ["عميل تجاري (حساب العملاء)", "حساب أستاذ عام آخر"])
                 rv_party_type = VoucherPartyType.CUSTOMER if "عميل" in rv_party_type_lbl else VoucherPartyType.OTHER
             with r2:
-                rv_pay_lbl = st.selectbox("طريقة التحصيل:", list(pay_map.keys()), key="rv_pay")
+                rv_pay_lbl = st.selectbox("حساب الصندوق / البنك المستلم:", list(pay_map.keys()), key="rv_pay")
             with r3:
                 rv_date = st.date_input("تاريخ سند القبض:", value=date.today(), key="rv_dt")
 
@@ -1755,8 +2042,11 @@ elif menu_option == "💸 سندات القبض والصرف (الخزينة)":
                         db=db, voucher_type=VoucherType.RECEIPT, party_type=rv_party_type,
                         party_name=rv_party_name or "عميل", amount=rv_amount,
                         description=rv_desc or "تحصيل دفعة", voucher_date=rv_date,
-                        payment_method=pay_map[rv_pay_lbl], target_account_code=rv_target_acc,
-                        customer_id=rv_cust_id, cost_center_id=rv_cc
+                        payment_method=pay_map[rv_pay_lbl],
+                        treasury_account_code=pay_tr_code_map[rv_pay_lbl],
+                        target_account_code=rv_target_acc,
+                        customer_id=rv_cust_id, cost_center_id=rv_cc,
+                        performed_by=get_active_user_label()
                     )
                     st.success(f"✅ تم إصدار سند القبض برقم: {v_obj.voucher_number}")
                 except Exception as e:
@@ -1768,7 +2058,7 @@ elif menu_option == "💸 سندات القبض والصرف (الخزينة)":
                 pv_party_type_lbl = st.selectbox("نوع المستفيد:", ["مورد تجاري (سداد موردين)", "مصروف تشغيلي / حساب أستاذ عام"])
                 pv_party_type = VoucherPartyType.SUPPLIER if "مورد" in pv_party_type_lbl else VoucherPartyType.EXPENSE
             with p2:
-                pv_pay_lbl = st.selectbox("طريقة الصرف:", list(pay_map.keys()), key="pv_pay")
+                pv_pay_lbl = st.selectbox("حساب الصندوق / البنك الدافع:", list(pay_map.keys()), key="pv_pay")
             with p3:
                 pv_date = st.date_input("تاريخ سند الصرف:", value=date.today(), key="pv_dt")
 
@@ -1799,8 +2089,11 @@ elif menu_option == "💸 سندات القبض والصرف (الخزينة)":
                         db=db, voucher_type=VoucherType.PAYMENT, party_type=pv_party_type,
                         party_name=pv_party_name or "مستفيد", amount=pv_amount,
                         description=pv_desc or "سداد مستحقات", voucher_date=pv_date,
-                        payment_method=pay_map[pv_pay_lbl], target_account_code=pv_target_acc,
-                        supplier_id=pv_supp_id, cost_center_id=pv_cc, include_input_vat=pv_inc_vat
+                        payment_method=pay_map[pv_pay_lbl],
+                        treasury_account_code=pay_tr_code_map[pv_pay_lbl],
+                        target_account_code=pv_target_acc,
+                        supplier_id=pv_supp_id, cost_center_id=pv_cc, include_input_vat=pv_inc_vat,
+                        performed_by=get_active_user_label()
                     )
                     st.success(f"✅ تم إصدار سند الصرف برقم: {v_obj.voucher_number}")
                 except Exception as e:
@@ -1972,7 +2265,8 @@ elif menu_option == "✍️ القيود اليومية ودفتر اليومي�
                     if st.button("🔄 عكس القيد المحاسبي المحدد الآن", type="primary", use_container_width=True, disabled=not can_rev):
                         try:
                             rev_e = LedgerService.reverse_journal_entry(
-                                db=db, entry_id=sel_je_obj.id, reason=rev_reason
+                                db=db, entry_id=sel_je_obj.id, reason=rev_reason,
+                                performed_by=get_active_user_label()
                             )
                             st.success(f"✅ تم توليد وترحيل القيد العكسي بنجاح برقم: {rev_e.entry_number}")
                             st.rerun()
@@ -1996,22 +2290,58 @@ elif menu_option == "📖 كشف الحساب وميزان المراجعة":
 
     db = get_db_session()
     try:
+        settings_gl = LedgerService.get_company_settings(db)
         with t_stmt:
             leaf_accounts = db.query(Account).filter(Account.is_leaf == True).order_by(Account.code).all()
             account_map = {f"{acc.code} - {acc.name_ar}": acc.code for acc in leaf_accounts}
-            selected_acc_label = st.selectbox("اختر الحساب:", list(account_map.keys()))
+            gl_c1, gl_c2, gl_c3, gl_c4 = st.columns([2, 1, 1, 1])
+            with gl_c1:
+                selected_acc_label = st.selectbox("اختر الحساب:", list(account_map.keys()))
+            with gl_c2:
+                gl_use_dt = st.checkbox("تصفية بفترة زمنية", value=False, key="gl_flt")
+            with gl_c3:
+                gl_sdt = st.date_input("من تاريخ:", value=date(settings_gl.fiscal_year, 1, 1), disabled=not gl_use_dt, key="gl_sdt")
+            with gl_c4:
+                gl_edt = st.date_input("إلى تاريخ:", value=date.today(), disabled=not gl_use_dt, key="gl_edt")
+
             if selected_acc_label:
-                stmt_data = LedgerService.get_account_statement(db=db, account_code=account_map[selected_acc_label])
+                stmt_data = LedgerService.get_account_statement(
+                    db=db, account_code=account_map[selected_acc_label],
+                    start_date=gl_sdt if gl_use_dt else None,
+                    end_date=gl_edt if gl_use_dt else None
+                )
                 b1, b2 = st.columns(2)
                 b1.metric("رصيد أول المدة:", f"{stmt_data['opening_balance']:,.2f} ريال")
                 b2.metric("رصيد نهاية الفترة:", f"{stmt_data['closing_balance']:,.2f} ريال")
                 if stmt_data["statement"]:
                     st.dataframe(pd.DataFrame(stmt_data["statement"]), use_container_width=True, hide_index=True)
+                else:
+                    st.info("لا توجد حركات مسجلة على هذا الحساب خلال الفترة المحددة.")
 
         with t_tb:
-            inc_zero = st.checkbox("عرض الحسابات ذات الأرصدة الصفرية", value=False)
-            tb_df = LedgerService.get_live_trial_balance(db, include_zero_balances=inc_zero)
+            tb_c1, tb_c2, tb_c3, tb_c4 = st.columns([1.2, 1, 1, 1])
+            with tb_c1:
+                inc_zero = st.checkbox("عرض الحسابات ذات الأرصدة الصفرية", value=False)
+            with tb_c2:
+                tb_use_dt = st.checkbox("تصفية بفترة زمنية", value=False, key="tb_flt")
+            with tb_c3:
+                tb_sdt = st.date_input("من تاريخ:", value=date(settings_gl.fiscal_year, 1, 1), disabled=not tb_use_dt, key="tb_sdt")
+            with tb_c4:
+                tb_edt = st.date_input("إلى تاريخ:", value=date.today(), disabled=not tb_use_dt, key="tb_edt")
+
+            tb_df = LedgerService.get_live_trial_balance(
+                db,
+                start_date=tb_sdt if tb_use_dt else None,
+                end_date=tb_edt if tb_use_dt else None,
+                include_zero_balances=inc_zero
+            )
             if not tb_df.empty:
+                tm1, tm2, tm3 = st.columns(3)
+                tot_cl_d = float(tb_df["Closing Debit"].sum())
+                tot_cl_c = float(tb_df["Closing Credit"].sum())
+                tm1.metric("إجمالي الأرصدة الختامية المدينة", f"{tot_cl_d:,.2f} ريال")
+                tm2.metric("إجمالي الأرصدة الختامية الدائنة", f"{tot_cl_c:,.2f} ريال")
+                tm3.metric("مطابقة اتزان الميزان", "متزن 100% ✅" if abs(tot_cl_d - tot_cl_c) < 0.01 else f"فرق: {(tot_cl_d - tot_cl_c):,.2f}")
                 st.dataframe(tb_df, use_container_width=True, hide_index=True)
     finally:
         db.close()
@@ -2025,7 +2355,20 @@ elif menu_option == "🏛️ القوائم المالية والزكاة وال
     db = get_db_session()
     try:
         settings = LedgerService.get_company_settings(db)
-        tb_df = LedgerService.get_live_trial_balance(db, include_zero_balances=True)
+        fs_c1, fs_c2, fs_c3, fs_c4 = st.columns([1.2, 1, 1, 1.5])
+        with fs_c1:
+            fs_use_dt = st.checkbox("تحديد فترة مالية مخصصة للقوائم", value=False, key="fs_flt")
+        with fs_c2:
+            fs_sdt = st.date_input("من تاريخ:", value=date(settings.fiscal_year, 1, 1), disabled=not fs_use_dt, key="fs_sdt")
+        with fs_c3:
+            fs_edt = st.date_input("إلى تاريخ:", value=date.today(), disabled=not fs_use_dt, key="fs_edt")
+
+        tb_df = LedgerService.get_live_trial_balance(
+            db,
+            start_date=fs_sdt if fs_use_dt else None,
+            end_date=fs_edt if fs_use_dt else None,
+            include_zero_balances=True
+        )
         engine = FinancialStatementsEngine(trial_balance_df=tb_df, fiscal_year=settings.fiscal_year, vat_rate=settings.default_vat_rate)
         report = engine.generate_full_financial_report()
 
@@ -2034,29 +2377,141 @@ elif menu_option == "🏛️ القوائم المالية والزكاة وال
         cf = report["cash_flow_statement"]
         vat = report["vat_return"]
         zakat = report["zakat_declaration"]
+        ratios = report["financial_ratios"]
 
-        t1, t2, t3, t4, t5 = st.tabs([
+        with fs_c4:
+            st.markdown("<br>", unsafe_allow_html=True)
+            xl_bytes = ExportService.generate_excel_workbook(tb_df, report, company_name=settings.company_name_ar)
+            st.download_button(
+                "📊 تصدير القوائم المالية والزكاة والضريبة (Excel)",
+                data=xl_bytes,
+                file_name=f"MizanPro_Financial_Package_{settings.fiscal_year}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                type="primary",
+                disabled=not has_perm("act_export_reports")
+            )
+
+        t1, t2, t3, t4, t5, t6 = st.tabs([
             "📈 قائمة الدخل", "🏛️ المركز المالي", "💵 التدفقات النقدية",
-            "🧾 إقرار القيمة المضافة (VAT)", "🕌 إقرار الزكاة (ZATCA)"
+            "🧾 إقرار القيمة المضافة (VAT)", "🕌 إقرار الزكاة (ZATCA)", "📊 المؤشرات والنسب المالية"
         ])
         with t1:
             st.table(pd.DataFrame([
+                {"البند": "إجمالي إيرادات المبيعات والخدمات", "المبلغ (ريال)": f"{pnl['gross_sales']:,.2f}"},
+                {"البند": "يخصم: مردودات المبيعات والخصم المسموح به", "المبلغ (ريال)": f"({(pnl['sales_returns'] + pnl['sales_discounts']):,.2f})"},
                 {"البند": "صافي الإيرادات التشغيلية", "المبلغ (ريال)": f"{pnl['net_revenue']:,.2f}"},
-                {"البند": "تكلفة البضاعة المباعة", "المبلغ (ريال)": f"({pnl['cost_of_sales']:,.2f})"},
-                {"البند": "مجمل الربح", "المبلغ (ريال)": f"{pnl['gross_profit']:,.2f}"},
-                {"البند": "إجمالي المصروفات التشغيلية والإدارية", "المبلغ (ريال)": f"({pnl['operating_expenses']['total']:,.2f})"},
-                {"البند": "صافي الربح قبل الزكاة", "المبلغ (ريال)": f"{pnl['profit_before_zakat']:,.2f}"},
-                {"البند": "مخصص الزكاة الشرعية", "المبلغ (ريال)": f"({pnl['zakat_expense']:,.2f})"},
-                {"البند": "صافي ربح الفترة النهائي", "المبلغ (ريال)": f"{pnl['net_profit']:,.2f}"},
+                {"البند": "يخصم: صافي تكلفة البضاعة المباعة (COGS)", "المبلغ (ريال)": f"({pnl['cost_of_sales']:,.2f})"},
+                {"البند": "مجمل الربح التشغيلي (Gross Profit)", "المبلغ (ريال)": f"{pnl['gross_profit']:,.2f} ({pnl['gross_margin_pct']:.1f}%)"},
+                {"البند": "يخصم: إجمالي المصروفات التشغيلية والإدارية والعمومية", "المبلغ (ريال)": f"({pnl['operating_expenses']['total']:,.2f})"},
+                {"البند": "صافي الربح التشغيلي (Operating Profit - EBIT)", "المبلغ (ريال)": f"{pnl['operating_profit']:,.2f}"},
+                {"البند": "الإيرادات الأخرى - (المصروفات التمويلية والبنكية)", "المبلغ (ريال)": f"{(pnl['other_income'] - pnl['financial_charges']):,.2f}"},
+                {"البند": "صافي الربح قبل الزكاة الشرعية", "المبلغ (ريال)": f"{pnl['profit_before_zakat']:,.2f}"},
+                {"البند": "يخصم: مخصص الزكاة الشرعية التقديري", "المبلغ (ريال)": f"({pnl['zakat_expense']:,.2f})"},
+                {"البند": "💰 صافي ربح / (خسارة) الفترة النهائي", "المبلغ (ريال)": f"{pnl['net_profit']:,.2f} ({pnl['net_margin_pct']:.1f}%)"},
             ]))
+            if pnl["operating_expenses"]["breakdown"]:
+                with st.expander("🔍 استعراض تفصيل بنود المصروفات التشغيلية والإدارية"):
+                    st.table(pd.DataFrame([
+                        {"كود الحساب": x["code"], "اسم حساب المصروف": x["name"], "المبلغ (ريال)": f"{x['amount']:,.2f}"}
+                        for x in pnl["operating_expenses"]["breakdown"]
+                    ]))
+
         with t2:
-            st.write(f"**إجمالي الأصول:** `{bs['total_assets']:,.2f} ريال` | **إجمالي الالتزامات وحقوق الملكية:** `{bs['total_liabilities_and_equity']:,.2f} ريال`")
+            bs_m1, bs_m2, bs_m3 = st.columns(3)
+            bs_m1.metric("إجمالي الأصول", f"{bs['total_assets']:,.2f} ريال")
+            bs_m2.metric("إجمالي الالتزامات وحقوق الملكية", f"{bs['total_liabilities_and_equity']:,.2f} ريال")
+            bs_m3.metric("حالة معادلة الميزانية", "متزنة 100% ✅" if bs["is_balanced"] else f"فرق: {bs['balance_difference']:,.2f}")
+
+            bs_rows = [
+                {"القسم": "الأصول المتداولة", "البند": "النقدية بالصندوق والحسابات البنكية", "المبلغ (ريال)": f"{bs['assets']['current_assets']['cash_and_banks']:,.2f}"},
+                {"القسم": "الأصول المتداولة", "البند": "صافي الذمم المدينة التجارية (العملاء بعد المخصص)", "المبلغ (ريال)": f"{bs['assets']['current_assets']['net_receivables']:,.2f}"},
+                {"القسم": "الأصول المتداولة", "البند": "المخزون السلعي (بتكلفة المتوسط المرجح WAC)", "المبلغ (ريال)": f"{bs['assets']['current_assets']['inventory']:,.2f}"},
+                {"القسم": "الأصول المتداولة", "البند": "المصروفات المدفوعة مقدماً والأرصدة المدينة الأخرى", "المبلغ (ريال)": f"{bs['assets']['current_assets']['prepaid_and_other']:,.2f}"},
+                {"القسم": "الأصول المتداولة", "البند": "🔹 إجمالي الأصول المتداولة", "المبلغ (ريال)": f"{bs['assets']['current_assets']['total']:,.2f}"},
+                {"القسم": "الأصول غير المتداولة", "البند": "إجمالي التكلفة التاريخية للأصول الثابتة", "المبلغ (ريال)": f"{bs['assets']['non_current_assets']['gross_fixed_assets']:,.2f}"},
+                {"القسم": "الأصول غير المتداولة", "البند": "يخصم: مجمع إهلاك الأصول الثابتة", "المبلغ (ريال)": f"({bs['assets']['non_current_assets']['accumulated_depreciation']:,.2f})"},
+                {"القسم": "الأصول غير المتداولة", "البند": "الأصول غير الملموسة", "المبلغ (ريال)": f"{bs['assets']['non_current_assets']['intangible_assets']:,.2f}"},
+                {"القسم": "الأصول غير المتداولة", "البند": "🔹 صافي الأصول غير المتداولة", "المبلغ (ريال)": f"{bs['assets']['non_current_assets']['total']:,.2f}"},
+                {"القسم": "إجمالي الأصول", "البند": "🔵 إجمالي الأصول", "المبلغ (ريال)": f"{bs['total_assets']:,.2f}"},
+                {"القسم": "الالتزامات المتداولة", "البند": "الموردون والذمم الدائنة التجارية", "المبلغ (ريال)": f"{bs['liabilities']['current_liabilities']['accounts_payable']:,.2f}"},
+                {"القسم": "الالتزامات المتداولة", "البند": "المصروفات المستحقة والأرصدة الدائنة الأخرى", "المبلغ (ريال)": f"{bs['liabilities']['current_liabilities']['accrued_expenses']:,.2f}"},
+                {"القسم": "الالتزامات المتداولة", "البند": "صافي ضريبة القيمة المضافة المستحقة للهيئة", "المبلغ (ريال)": f"{bs['liabilities']['current_liabilities']['net_vat_payable']:,.2f}"},
+                {"القسم": "الالتزامات المتداولة", "البند": "مخصص الزكاة الشرعية المستحقة", "المبلغ (ريال)": f"{bs['liabilities']['current_liabilities']['zakat_provision']:,.2f}"},
+                {"القسم": "الالتزامات المتداولة", "البند": "🔸 إجمالي الالتزامات المتداولة", "المبلغ (ريال)": f"{bs['liabilities']['current_liabilities']['total']:,.2f}"},
+                {"القسم": "الالتزامات غير المتداولة", "البند": "القروض طويلة الأجل ومخصص مكافأة نهاية الخدمة", "المبلغ (ريال)": f"{bs['liabilities']['non_current_liabilities']['total']:,.2f}"},
+                {"القسم": "حقوق الملكية", "البند": "رأس المال والاحتياطي النظامي وجاري الشركاء", "المبلغ (ريال)": f"{(bs['equity']['capital'] + bs['equity']['statutory_reserve'] + bs['equity']['partners_current_account']):,.2f}"},
+                {"القسم": "حقوق الملكية", "البند": "الأرباح المبقاة وصافي ربح الفترة الحالية", "المبلغ (ريال)": f"{(bs['equity']['retained_earnings_prior'] + bs['equity']['current_year_net_profit']):,.2f}"},
+                {"القسم": "حقوق الملكية", "البند": "🔸 صافي حقوق الملكية", "المبلغ (ريال)": f"{bs['equity']['total']:,.2f}"},
+                {"القسم": "إجمالي الالتزامات وحقوق الملكية", "البند": "🟢 إجمالي الالتزامات وحقوق الملكية", "المبلغ (ريال)": f"{bs['total_liabilities_and_equity']:,.2f}"},
+            ]
+            st.table(pd.DataFrame(bs_rows))
+
         with t3:
-            st.write(f"**صافي النقد من الأنشطة التشغيلية:** `{cf['operating_activities']['net_cash_from_operating']:,.2f} ريال` | **رصيد النقد الختامي:** `{cf['closing_cash_balance']:,.2f} ريال`")
+            op_cf = cf["operating_activities"]
+            wc_cf = op_cf["working_capital_changes"]
+            inv_cf = cf["investing_activities"]
+            fin_cf = cf["financing_activities"]
+            cf_rows = [
+                {"القسم": "الأنشطة التشغيلية", "البيان": "صافي الربح قبل الزكاة الشرعية", "المبلغ (ريال)": f"{op_cf['profit_before_zakat']:,.2f}"},
+                {"القسم": "الأنشطة التشغيلية", "البيان": "يضاف: مصروف الإهلاك والبنود غير النقدية", "المبلغ (ريال)": f"{op_cf['depreciation_add_back']:,.2f}"},
+                {"القسم": "الأنشطة التشغيلية", "البيان": "التغير في الذمم المدينة والأرصدة المدينة", "المبلغ (ريال)": f"{(wc_cf['receivables_change'] + wc_cf['prepaid_and_other_change']):,.2f}"},
+                {"القسم": "الأنشطة التشغيلية", "البيان": "التغير في المخزون السلعي", "المبلغ (ريال)": f"{wc_cf['inventory_change']:,.2f}"},
+                {"القسم": "الأنشطة التشغيلية", "البيان": "التغير في الموردين والمستحقات والضرائب", "المبلغ (ريال)": f"{(wc_cf['payables_change'] + wc_cf['accruals_and_vat_change']):,.2f}"},
+                {"القسم": "الأنشطة التشغيلية", "البيان": "1️⃣ صافي النقد الناتج من الأنشطة التشغيلية", "المبلغ (ريال)": f"{op_cf['net_cash_from_operating']:,.2f}"},
+                {"القسم": "الأنشطة الاستثمارية", "البيان": "حيازة وإضافات الأصول الثابتة وغير الملموسة", "المبلغ (ريال)": f"{inv_cf['net_cash_from_investing']:,.2f}"},
+                {"القسم": "الأنشطة التمويلية", "البيان": "التغير في القروض وحقوق الملكية وجاري الشركاء", "المبلغ (ريال)": f"{fin_cf['net_cash_from_financing']:,.2f}"},
+                {"القسم": "ملخص النقدية", "البيان": "صافي التغير في النقدية وما في حكمها خلال الفترة", "المبلغ (ريال)": f"{cf['net_change_in_cash']:,.2f}"},
+                {"القسم": "ملخص النقدية", "البيان": "رصيد النقدية والبنوك في بداية الفترة", "المبلغ (ريال)": f"{cf['opening_cash_balance']:,.2f}"},
+                {"القسم": "ملخص النقدية", "البيان": "💰 رصيد النقدية والبنوك في نهاية الفترة (مطابق للمركز المالي)", "المبلغ (ريال)": f"{cf['closing_cash_balance']:,.2f}"},
+            ]
+            st.table(pd.DataFrame(cf_rows))
+
         with t4:
-            st.write(f"**صافي ضريبة القيمة المضافة المستحقة:** `{vat['net_vat_due']:,.2f} ريال` ({vat['settlement_status']})")
+            v1, v2, v3 = st.columns(3)
+            v1.metric("إجمالي ضريبة المخرجات (المبيعات)", f"{vat['box_1_std_sales']['vat_amount']:,.2f} ريال")
+            v2.metric("إجمالي ضريبة المدخلات القابلة للخصم", f"{vat['box_7_std_purchases']['recoverable_vat']:,.2f} ريال")
+            v3.metric("صافي الضريبة المستحقة / (المستردة)", f"{vat['net_vat_due']:,.2f} ريال", delta=vat["settlement_status"])
+            st.table(pd.DataFrame([
+                {"رقم الحقل في نموذج ZATCA": "1", "البيان": vat["box_1_std_sales"]["label"], "المبلغ الخاضع (ريال)": f"{vat['box_1_std_sales']['taxable_amount']:,.2f}", "مبلغ الضريبة (15%)": f"{vat['box_1_std_sales']['vat_amount']:,.2f}"},
+                {"رقم الحقل في نموذج ZATCA": "7", "البيان": vat["box_7_std_purchases"]["label"], "المبلغ الخاضع (ريال)": f"{vat['box_7_std_purchases']['taxable_amount']:,.2f}", "مبلغ الضريبة (15%)": f"({vat['box_7_std_purchases']['recoverable_vat']:,.2f})"},
+                {"رقم الحقل في نموذج ZATCA": "14", "البيان": f"صافي ضريبة القيمة المضافة ({vat['settlement_status']})", "المبلغ الخاضع (ريال)": "-", "مبلغ الضريبة (15%)": f"{vat['net_vat_due']:,.2f}"},
+            ]))
+
         with t5:
-            st.write(f"**وعاء الزكاة الشرعي:** `{zakat['zakat_base']:,.2f} ريال` | **الزكاة المستحقة:** `{zakat['zakat_due']:,.2f} ريال`")
+            z1, z2, z3 = st.columns(3)
+            z1.metric("إجمالي الإضافات للوعاء الزكوي", f"{zakat['additions_to_zakat_base']['total_additions']:,.2f} ريال")
+            z2.metric("إجمالي الحسميات من الوعاء", f"{zakat['deductions_from_zakat_base']['total_deductions']:,.2f} ريال")
+            z3.metric("الزكاة الشرعية المستحقة (2.5%)", f"{zakat['zakat_due']:,.2f} ريال", delta=f"الوعاء: {zakat['zakat_base']:,.2f} ريال")
+            ad = zakat["additions_to_zakat_base"]
+            dd = zakat["deductions_from_zakat_base"]
+            st.table(pd.DataFrame([
+                {"القسم": "أولاً: عناصر الوعاء الموجبة", "البيان": "رأس المال المدفوع والاحتياطي النظامي والأرباح المبقاة", "المبلغ (ريال)": f"{(ad['capital'] + ad['statutory_reserve'] + ad['retained_earnings']):,.2f}"},
+                {"القسم": "أولاً: عناصر الوعاء الموجبة", "البيان": "صافي الربح المعدل للعام قبل الزكاة", "المبلغ (ريال)": f"{ad['adjusted_net_profit']:,.2f}"},
+                {"القسم": "أولاً: عناصر الوعاء الموجبة", "البيان": "القروض طويلة الأجل ومخصص نهاية الخدمة وجاري الشركاء الدائن", "المبلغ (ريال)": f"{(ad['long_term_loans'] + ad['eos_provision'] + ad['partners_credit_balance']):,.2f}"},
+                {"القسم": "أولاً: عناصر الوعاء الموجبة", "البيان": "➕ إجمالي الإضافات للوعاء الزكوي", "المبلغ (ريال)": f"{ad['total_additions']:,.2f}"},
+                {"القسم": "ثانياً: الحسميات من الوعاء", "البيان": "صافي القيمة الدفترية للأصول الثابتة والأصول غير الملموسة", "المبلغ (ريال)": f"({(dd['net_fixed_assets'] + dd['intangible_assets']):,.2f})"},
+                {"القسم": "ثالثاً: الوعاء ومقدار الزكاة", "البيان": "⚖️ صافي الوعاء الزكوي الخاضع للزكاة", "المبلغ (ريال)": f"{zakat['zakat_base']:,.2f}"},
+                {"القسم": "ثالثاً: الوعاء ومقدار الزكاة", "البيان": "🕌 مقدار الزكاة الشرعية المستحقة للهيئة (2.5%)", "المبلغ (ريال)": f"{zakat['zakat_due']:,.2f}"},
+            ]))
+
+        with t6:
+            r_c1, r_c2, r_c3, r_c4 = st.columns(4)
+            r_c1.metric("نسبة التداول (Current Ratio)", f"{ratios['current_ratio']:.2f} مرة")
+            r_c2.metric("نسبة السيولة السريعة (Quick Ratio)", f"{ratios['quick_ratio']:.2f} مرة")
+            r_c3.metric("العائد على الأصول (ROA)", f"{ratios['return_on_assets_pct']:.2f}%")
+            r_c4.metric("العائد على حقوق الملكية (ROE)", f"{ratios['return_on_equity_pct']:.2f}%")
+            st.table(pd.DataFrame([
+                {"المجموعة": "مؤشرات السيولة", "المؤشر المالي": "صافي رأس المال العامل (Working Capital)", "القيمة": f"{bs['working_capital']:,.2f} ريال"},
+                {"المجموعة": "مؤشرات السيولة", "المؤشر المالي": "نسبة التداول (الأصول المتداولة ÷ الالتزامات المتداولة)", "القيمة": f"{ratios['current_ratio']:.2f} مرة"},
+                {"المجموعة": "مؤشرات السيولة", "المؤشر المالي": "نسبة السيولة السريعة ((الأصول المتداولة - المخزون) ÷ الالتزامات المتداولة)", "القيمة": f"{ratios['quick_ratio']:.2f} مرة"},
+                {"المجموعة": "مؤشرات الربحية", "المؤشر المالي": "هامش مجمل الربح (Gross Margin %)", "القيمة": f"{ratios['gross_margin_pct']:.2f}%"},
+                {"المجموعة": "مؤشرات الربحية", "المؤشر المالي": "هامش الربح التشغيلي (Operating Margin %)", "القيمة": f"{ratios['operating_margin_pct']:.2f}%"},
+                {"المجموعة": "مؤشرات الربحية", "المؤشر المالي": "هامش صافي الربح النهائي (Net Profit Margin %)", "القيمة": f"{ratios['net_margin_pct']:.2f}%"},
+                {"المجموعة": "مؤشرات الكفاءة والرفع المالي", "المؤشر المالي": "العائد على إجمالي الأصول (ROA %)", "القيمة": f"{ratios['return_on_assets_pct']:.2f}%"},
+                {"المجموعة": "مؤشرات الكفاءة والرفع المالي", "المؤشر المالي": "العائد على حقوق الملكية (ROE %)", "القيمة": f"{ratios['return_on_equity_pct']:.2f}%"},
+                {"المجموعة": "مؤشرات الكفاءة والرفع المالي", "المؤشر المالي": "نسبة المديونية إلى الأصول (Debt to Assets %)", "القيمة": f"{ratios['debt_to_assets_pct']:.2f}%"},
+            ]))
     finally:
         db.close()
 

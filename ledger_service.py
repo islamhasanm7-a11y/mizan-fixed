@@ -492,6 +492,15 @@ class LedgerService:
         return cc
 
     @classmethod
+    def get_treasury_and_bank_accounts(cls, db: Session) -> List[Account]:
+        """استرجاع كافة حسابات الصناديق النقدية (1101) والبنوك (1102) الفرعية النشطة"""
+        return db.query(Account).filter(
+            Account.is_leaf == True,
+            Account.is_active == True,
+            (Account.code.like("1101%") | Account.code.like("1102%"))
+        ).order_by(Account.code).all()
+
+    @classmethod
     def create_or_update_customer(
         cls,
         db: Session,
@@ -503,15 +512,22 @@ class LedgerService:
         phone: Optional[str] = None,
         email: Optional[str] = None,
         address: Optional[str] = None,
-        credit_limit: float = 0.0
+        credit_limit: float = 0.0,
+        is_active: bool = True,
+        performed_by: str = "مدير النظام (Admin)"
     ) -> Customer:
         if not name_ar.strip():
             raise LedgerValidationError("اسم العميل مطلوب.")
-        if not code:
-            code = cls._next_sequence_code(db, Customer, Customer.code, "CUST-", pad=3)
 
         ar_acc = db.query(Account).filter(Account.code == "110301").first()
-        cust = db.query(Customer).filter(Customer.code == code).first()
+        cust = (
+            db.query(Customer).filter(Customer.code == code).first()
+            if code else db.query(Customer).filter(Customer.name_ar == name_ar.strip()).first()
+        )
+        if not code:
+            code = cust.code if cust else cls._next_sequence_code(db, Customer, Customer.code, "CUST-", pad=3)
+
+        action_name = "UPDATE_CUSTOMER" if cust else "CREATE_CUSTOMER"
         if cust:
             cust.name_ar = name_ar.strip()
             cust.name_en = name_en
@@ -521,14 +537,21 @@ class LedgerService:
             cust.email = email
             cust.address = address
             cust.credit_limit = float(credit_limit)
+            cust.is_active = bool(is_active)
         else:
             cust = Customer(
                 code=code, name_ar=name_ar.strip(), name_en=name_en,
                 vat_number=vat_number, cr_number=cr_number, phone=phone,
                 email=email, address=address, credit_limit=float(credit_limit),
-                account_id=ar_acc.id if ar_acc else None
+                account_id=ar_acc.id if ar_acc else None,
+                is_active=bool(is_active)
             )
             db.add(cust)
+            db.flush()
+        db.add(AuditLog(
+            table_name="customers", record_id=cust.id, action=action_name,
+            performed_by=performed_by, details=f"Customer: {cust.code} - {cust.name_ar}, Limit: {cust.credit_limit:,.2f}"
+        ))
         db.commit()
         db.refresh(cust)
         return cust
@@ -544,15 +567,22 @@ class LedgerService:
         cr_number: Optional[str] = None,
         phone: Optional[str] = None,
         email: Optional[str] = None,
-        address: Optional[str] = None
+        address: Optional[str] = None,
+        is_active: bool = True,
+        performed_by: str = "مدير النظام (Admin)"
     ) -> Supplier:
         if not name_ar.strip():
             raise LedgerValidationError("اسم المورد مطلوب.")
-        if not code:
-            code = cls._next_sequence_code(db, Supplier, Supplier.code, "SUPP-", pad=3)
 
         ap_acc = db.query(Account).filter(Account.code == "210101").first()
-        supp = db.query(Supplier).filter(Supplier.code == code).first()
+        supp = (
+            db.query(Supplier).filter(Supplier.code == code).first()
+            if code else db.query(Supplier).filter(Supplier.name_ar == name_ar.strip()).first()
+        )
+        if not code:
+            code = supp.code if supp else cls._next_sequence_code(db, Supplier, Supplier.code, "SUPP-", pad=3)
+
+        action_name = "UPDATE_SUPPLIER" if supp else "CREATE_SUPPLIER"
         if supp:
             supp.name_ar = name_ar.strip()
             supp.name_en = name_en
@@ -561,13 +591,20 @@ class LedgerService:
             supp.phone = phone
             supp.email = email
             supp.address = address
+            supp.is_active = bool(is_active)
         else:
             supp = Supplier(
                 code=code, name_ar=name_ar.strip(), name_en=name_en,
                 vat_number=vat_number, cr_number=cr_number, phone=phone,
-                email=email, address=address, account_id=ap_acc.id if ap_acc else None
+                email=email, address=address, account_id=ap_acc.id if ap_acc else None,
+                is_active=bool(is_active)
             )
             db.add(supp)
+            db.flush()
+        db.add(AuditLog(
+            table_name="suppliers", record_id=supp.id, action=action_name,
+            performed_by=performed_by, details=f"Supplier: {supp.code} - {supp.name_ar}"
+        ))
         db.commit()
         db.refresh(supp)
         return supp
@@ -587,7 +624,9 @@ class LedgerService:
         reorder_level: float = 5.0,
         stock_quantity: float = 0.0,
         tax_rate: float = 0.15,
-        is_service: bool = False
+        is_service: bool = False,
+        is_active: bool = True,
+        performed_by: str = "مدير النظام (Admin)"
     ) -> Product:
         if not name_ar.strip():
             raise LedgerValidationError("اسم الصنف مطلوب.")
@@ -596,6 +635,7 @@ class LedgerService:
             code = cls._next_sequence_code(db, Product, Product.code, prefix, pad=3)
 
         prod = db.query(Product).filter(Product.code == code).first()
+        action_name = "UPDATE_PRODUCT" if prod else "CREATE_PRODUCT"
         if prod:
             prod.name_ar = name_ar.strip()
             prod.name_en = name_en
@@ -607,6 +647,7 @@ class LedgerService:
             prod.reorder_level = float(reorder_level)
             prod.tax_rate = float(tax_rate)
             prod.is_service = bool(is_service)
+            prod.is_active = bool(is_active)
         else:
             init_qty = 0.0 if is_service else float(stock_quantity)
             prod = Product(
@@ -615,12 +656,17 @@ class LedgerService:
                 stock_quantity=init_qty,
                 reorder_level=0.0 if is_service else float(reorder_level),
                 cost_price=float(cost_price), sale_price=float(sale_price),
-                tax_rate=float(tax_rate), is_service=bool(is_service)
+                tax_rate=float(tax_rate), is_service=bool(is_service),
+                is_active=bool(is_active)
             )
             db.add(prod)
             db.flush()
             if not is_service:
                 cls._sync_warehouse_stock(db, prod, init_qty)
+        db.add(AuditLog(
+            table_name="products", record_id=prod.id, action=action_name,
+            performed_by=performed_by, details=f"Product: {prod.code} - {prod.name_ar}, Cost: {prod.cost_price:,.2f}, Price: {prod.sale_price:,.2f}"
+        ))
         db.commit()
         db.refresh(prod)
         return prod
@@ -819,6 +865,7 @@ class LedgerService:
         seller_vat_number: Optional[str] = None,
         notes: Optional[str] = None,
         allow_negative_stock: bool = False,
+        treasury_account_code: Optional[str] = None,
         performed_by: str = "مدير النظام (Admin)"
     ) -> SalesInvoice:
         try:
@@ -935,10 +982,10 @@ class LedgerService:
             )
 
             if payment_method == PaymentMethod.CASH:
-                debit_acc_code = "110101"
+                debit_acc_code = treasury_account_code or "110101"
                 payment_desc = "نقداً بالصندوق"
             elif payment_method == PaymentMethod.BANK:
-                debit_acc_code = "110201"
+                debit_acc_code = treasury_account_code or "110201"
                 payment_desc = "تحويل بنكي / نقاط بيع"
             else:
                 debit_acc_code = "110301"
@@ -1050,6 +1097,7 @@ class LedgerService:
         cost_center_id: Optional[int] = None,
         warehouse_id: Optional[int] = None,
         notes: Optional[str] = None,
+        treasury_account_code: Optional[str] = None,
         performed_by: str = "مدير النظام (Admin)"
     ) -> PurchaseInvoice:
         try:
@@ -1133,10 +1181,10 @@ class LedgerService:
             grand_total = round(taxable_amount + total_vat, 2)
 
             if payment_method == PaymentMethod.CASH:
-                credit_acc_code = "110101"
+                credit_acc_code = treasury_account_code or "110101"
                 payment_desc = "سداد نقدي فوري"
             elif payment_method == PaymentMethod.BANK:
-                credit_acc_code = "110201"
+                credit_acc_code = treasury_account_code or "110201"
                 payment_desc = "سداد بتحويل بنكي"
             else:
                 credit_acc_code = "210101"
@@ -1241,7 +1289,8 @@ class LedgerService:
         new_actual_quantity: float,
         adjustment_date: Optional[date] = None,
         warehouse_id: Optional[int] = None,
-        reason: str = "تسوية جرد مخزني فعلي"
+        reason: str = "تسوية جرد مخزني فعلي",
+        performed_by: str = "مدير النظام (Admin)"
     ) -> InventoryTransaction:
         try:
             adj_date = adjustment_date or date.today()
@@ -1275,7 +1324,8 @@ class LedgerService:
                 je = cls.create_journal_entry(
                     db=db, description=f"تسوية جرد مخزني للصنف [{prod.code} - {prod.name_ar}] - {reason}",
                     lines_data=adj_lines, entry_date=adj_date, reference=ref_no,
-                    doc_type=DocumentType.INVENTORY_ADJUSTMENT, auto_post=True, commit=False
+                    doc_type=DocumentType.INVENTORY_ADJUSTMENT, auto_post=True, commit=False,
+                    performed_by=performed_by
                 )
 
             prod.stock_quantity = round(float(new_actual_quantity), 4)
@@ -1316,7 +1366,9 @@ class LedgerService:
         supplier_id: Optional[int] = None,
         party_vat_number: Optional[str] = None,
         warehouse_id: Optional[int] = None,
-        reason: str = "مرتجع بضاعة طبقاً للاتفاق"
+        reason: str = "مرتجع بضاعة طبقاً للاتفاق",
+        treasury_account_code: Optional[str] = None,
+        performed_by: str = "مدير النظام (Admin)"
     ) -> CreditDebitNote:
         try:
             if not note_date:
@@ -1393,7 +1445,7 @@ class LedgerService:
 
             cogs_entry = None
             if note_type == NoteType.CREDIT_NOTE:
-                cr_acc = "110101" if payment_method == PaymentMethod.CASH else ("110201" if payment_method == PaymentMethod.BANK else "110301")
+                cr_acc = (treasury_account_code or "110101") if payment_method == PaymentMethod.CASH else ((treasury_account_code or "110201") if payment_method == PaymentMethod.BANK else "110301")
                 j_lines = [{"account_code": "4102", "debit": taxable_amount, "credit": 0.0, "description": f"مردودات مبيعات إشعار دائن {note_number}"}]
                 if total_vat > 0:
                     j_lines.append({"account_code": "210204", "debit": total_vat, "credit": 0.0, "description": f"تخفيض ضريبة المخرجات إشعار دائن {note_number}"})
@@ -1408,7 +1460,8 @@ class LedgerService:
                 main_entry = cls.create_journal_entry(
                     db=db, description=f"إثبات إشعار دائن (مرتجع مبيعات) رقم {note_number} - {party_name} ({reason})",
                     lines_data=j_lines, entry_date=note_date, reference=note_number,
-                    doc_type=DocumentType.SALES_RETURN, auto_post=True, commit=False
+                    doc_type=DocumentType.SALES_RETURN, auto_post=True, commit=False,
+                    performed_by=performed_by
                 )
 
                 if total_cost_rev > 0:
@@ -1419,7 +1472,8 @@ class LedgerService:
                     cogs_entry = cls.create_journal_entry(
                         db=db, description=f"إعادة البضاعة المرتجعة للمخزون وعكس تكلفة المبيعات للإشعار {note_number}",
                         lines_data=cogs_rev_lines, entry_date=note_date, reference=f"COGS-{note_number}",
-                        doc_type=DocumentType.SALES_RETURN, auto_post=True, commit=False
+                        doc_type=DocumentType.SALES_RETURN, auto_post=True, commit=False,
+                        performed_by=performed_by
                     )
 
                 for prod_obj, qty, unit_cost, line_cost, _ in inventory_updates:
@@ -1438,7 +1492,7 @@ class LedgerService:
                         notes=f"مرتجع مبيعات من العميل: {party_name}"
                     ))
             else:
-                dr_acc = "110101" if payment_method == PaymentMethod.CASH else ("110201" if payment_method == PaymentMethod.BANK else "210101")
+                dr_acc = (treasury_account_code or "110101") if payment_method == PaymentMethod.CASH else ((treasury_account_code or "110201") if payment_method == PaymentMethod.BANK else "210101")
                 # حساب القيمة المخزنية المستبعدة بدقة ومطابقة أي فرق سعر مع حساب فروق المخزون 5105
                 total_inv_credit = 0.0
                 prepared_dn_updates = []
@@ -1495,7 +1549,8 @@ class LedgerService:
                 main_entry = cls.create_journal_entry(
                     db=db, description=f"إثبات إشعار مدين (مرتجع مشتريات) رقم {note_number} - المورد: {party_name} ({reason})",
                     lines_data=j_lines, entry_date=note_date, reference=note_number,
-                    doc_type=DocumentType.PURCHASE_RETURN, auto_post=True, commit=False
+                    doc_type=DocumentType.PURCHASE_RETURN, auto_post=True, commit=False,
+                    performed_by=performed_by
                 )
 
                 for prod_obj, qty, new_qty, new_cost, inv_credit_line in prepared_dn_updates:
@@ -1552,11 +1607,13 @@ class LedgerService:
         voucher_date: Optional[date] = None,
         payment_method: PaymentMethod = PaymentMethod.CASH,
         target_account_code: Optional[str] = None,
+        treasury_account_code: Optional[str] = None,
         customer_id: Optional[int] = None,
         supplier_id: Optional[int] = None,
         cost_center_id: Optional[int] = None,
         include_input_vat: bool = False,
-        reference_number: Optional[str] = None
+        reference_number: Optional[str] = None,
+        performed_by: str = "مدير النظام (Admin)"
     ) -> CashVoucher:
         try:
             if not voucher_date:
@@ -1566,8 +1623,14 @@ class LedgerService:
 
             settings = cls.get_company_settings(db)
             voucher_number = cls.generate_voucher_number(db, voucher_type, voucher_date.year)
-            treasury_acc_code = "110101" if payment_method == PaymentMethod.CASH else "110201"
-            treasury_label = "الصندوق الرئيسي" if payment_method == PaymentMethod.CASH else "الحساب البنكي الجاري"
+            if treasury_account_code:
+                treasury_acc_code = str(treasury_account_code).strip()
+                tr_acc_obj = db.query(Account).filter(Account.code == treasury_acc_code).first()
+                treasury_label = tr_acc_obj.name_ar if tr_acc_obj else ("الصندوق النقدي" if treasury_acc_code.startswith("1101") else "الحساب البنكي")
+                payment_method = PaymentMethod.CASH if treasury_acc_code.startswith("1101") else PaymentMethod.BANK
+            else:
+                treasury_acc_code = "110101" if payment_method == PaymentMethod.CASH else "110201"
+                treasury_label = "الصندوق الرئيسي" if payment_method == PaymentMethod.CASH else "الحساب البنكي الجاري"
 
             if party_type == VoucherPartyType.CUSTOMER:
                 target_account_code = target_account_code or "110301"
@@ -1639,7 +1702,7 @@ class LedgerService:
                 db=db,
                 description=f"{'سند قبض' if voucher_type == VoucherType.RECEIPT else 'سند صرف'} رقم {voucher_number} - {party_name}: {description}",
                 lines_data=lines, entry_date=voucher_date, reference=reference_number or voucher_number,
-                doc_type=doc_t, auto_post=True, commit=False
+                doc_type=doc_t, auto_post=True, commit=False, performed_by=performed_by
             )
 
             voucher = CashVoucher(
@@ -1675,7 +1738,10 @@ class LedgerService:
         accumulated_depreciation: float = 0.0,
         asset_code: Optional[str] = None,
         post_purchase_entry: bool = False,
-        payment_method: PaymentMethod = PaymentMethod.BANK
+        payment_method: PaymentMethod = PaymentMethod.BANK,
+        treasury_account_code: Optional[str] = None,
+        is_active: bool = True,
+        performed_by: str = "مدير النظام (Admin)"
     ) -> FixedAsset:
         """إضافة أو تحديث أصل ثابت في سجل الأصول مع خيار توليد قيد الشراء آلياً"""
         if not name_ar.strip():
@@ -1698,6 +1764,7 @@ class LedgerService:
         useful_life = round(1.0 / depreciation_rate, 1) if depreciation_rate > 0 else 5.0
 
         fa = db.query(FixedAsset).filter(FixedAsset.asset_code == asset_code).first()
+        action_name = "UPDATE_FIXED_ASSET" if fa else "CREATE_FIXED_ASSET"
         if fa:
             fa.name_ar = name_ar.strip()
             fa.category = category
@@ -1710,6 +1777,7 @@ class LedgerService:
             fa.net_book_value = nbv
             fa.asset_account_code = asset_acc
             fa.accum_dep_account_code = accum_acc
+            fa.is_active = bool(is_active)
         else:
             fa = FixedAsset(
                 asset_code=asset_code, name_ar=name_ar.strip(), category=category,
@@ -1718,12 +1786,14 @@ class LedgerService:
                 depreciation_rate=float(depreciation_rate),
                 accumulated_depreciation=float(accumulated_depreciation),
                 net_book_value=nbv, asset_account_code=asset_acc,
-                accum_dep_account_code=accum_acc, dep_expense_account_code="5207"
+                accum_dep_account_code=accum_acc, dep_expense_account_code="5207",
+                is_active=bool(is_active)
             )
             db.add(fa)
+            db.flush()
 
             if post_purchase_entry:
-                cr_code = "110101" if payment_method == PaymentMethod.CASH else ("110201" if payment_method == PaymentMethod.BANK else "210101")
+                cr_code = treasury_account_code or ("110101" if payment_method == PaymentMethod.CASH else ("110201" if payment_method == PaymentMethod.BANK else "210101"))
                 cls.create_journal_entry(
                     db=db,
                     description=f"إثبات شراء واقتناء أصل ثابت [{asset_code} - {name_ar}]",
@@ -1735,9 +1805,14 @@ class LedgerService:
                     reference=asset_code,
                     doc_type=DocumentType.PAYMENT_VOUCHER,
                     auto_post=True,
-                    commit=False
+                    commit=False,
+                    performed_by=performed_by
                 )
 
+        db.add(AuditLog(
+            table_name="fixed_assets", record_id=fa.id, action=action_name,
+            performed_by=performed_by, details=f"Asset: {fa.asset_code} - {fa.name_ar}, Cost: {fa.purchase_cost:,.2f}"
+        ))
         db.commit()
         db.refresh(fa)
         return fa
@@ -1747,7 +1822,8 @@ class LedgerService:
         cls,
         db: Session,
         dep_date: Optional[date] = None,
-        months: int = 12
+        months: int = 12,
+        performed_by: str = "مدير النظام (Admin)"
     ) -> JournalEntry:
         """احتساب وترحيل قسط الإهلاك الدوري لكافة الأصول الثابتة النشطة مع منع التكرار لنفس الفترة"""
         dep_date = dep_date or date.today()
@@ -1813,7 +1889,8 @@ class LedgerService:
             reference=period_ref,
             doc_type=DocumentType.DEPRECIATION_RUN,
             auto_post=True,
-            commit=True
+            commit=True,
+            performed_by=performed_by
         )
         return je
 
@@ -1833,7 +1910,8 @@ class LedgerService:
                 "القسط السنوي": annual_dep,
                 "مجمع الإهلاك المتراكم": round(fa.accumulated_depreciation, 2),
                 "صافي القيمة الدفترية": round(fa.net_book_value, 2),
-                "آخر إهلاك": fa.last_depreciation_date.strftime("%Y-%m-%d") if fa.last_depreciation_date else "-"
+                "آخر إهلاك": fa.last_depreciation_date.strftime("%Y-%m-%d") if fa.last_depreciation_date else "-",
+                "الحالة": "نشط ✅" if fa.is_active else "موقوف ⛔"
             })
         return pd.DataFrame(rows)
 
@@ -1853,7 +1931,9 @@ class LedgerService:
         housing_allowance: float = 0.0,
         transport_allowance: float = 0.0,
         other_allowance: float = 0.0,
-        emp_code: Optional[str] = None
+        emp_code: Optional[str] = None,
+        is_active: bool = True,
+        performed_by: str = "مدير النظام (Admin)"
     ) -> Employee:
         if not name_ar.strip():
             raise LedgerValidationError("اسم الموظف مطلوب.")
@@ -1864,6 +1944,7 @@ class LedgerService:
             emp_code = cls._next_sequence_code(db, Employee, Employee.emp_code, "EMP-", pad=3)
 
         emp = db.query(Employee).filter(Employee.emp_code == emp_code).first()
+        action_name = "UPDATE_EMPLOYEE" if emp else "CREATE_EMPLOYEE"
         if emp:
             emp.name_ar = name_ar.strip()
             emp.job_title = job_title
@@ -1874,14 +1955,21 @@ class LedgerService:
             emp.housing_allowance = float(housing_allowance)
             emp.transport_allowance = float(transport_allowance)
             emp.other_allowance = float(other_allowance)
+            emp.is_active = bool(is_active)
         else:
             emp = Employee(
                 emp_code=emp_code, name_ar=name_ar.strip(), job_title=job_title,
                 nationality=nationality, is_saudi=is_saudi, join_date=join_date,
                 basic_salary=float(basic_salary), housing_allowance=float(housing_allowance),
-                transport_allowance=float(transport_allowance), other_allowance=float(other_allowance)
+                transport_allowance=float(transport_allowance), other_allowance=float(other_allowance),
+                is_active=bool(is_active)
             )
             db.add(emp)
+            db.flush()
+        db.add(AuditLog(
+            table_name="employees", record_id=emp.id, action=action_name,
+            performed_by=performed_by, details=f"Employee: {emp.emp_code} - {emp.name_ar}, Basic: {emp.basic_salary:,.2f}"
+        ))
         db.commit()
         db.refresh(emp)
         return emp
@@ -1951,8 +2039,10 @@ class LedgerService:
         period_month: str,
         payment_date: Optional[date] = None,
         payment_method: PaymentMethod = PaymentMethod.BANK,
+        treasury_account_code: Optional[str] = None,
         include_eos_accrual: bool = True,
-        notes: str = "صرف مسير الرواتب والأجور الشهري"
+        notes: str = "صرف مسير الرواتب والأجور الشهري",
+        performed_by: str = "مدير النظام (Admin)"
     ) -> PayrollRun:
         """إصدار وترحيل مسير الرواتب الشهري مع منع التكرار لنفس الشهر"""
         payment_date = payment_date or date.today()
@@ -1994,7 +2084,7 @@ class LedgerService:
         tot_net = round(tot_gross - tot_gosi_emp, 2)
         total_gosi_payable = round(tot_gosi_emp + tot_gosi_comp, 2)
 
-        treasury_acc = "110101" if payment_method == PaymentMethod.CASH else "110201"
+        treasury_acc = treasury_account_code or ("110101" if payment_method == PaymentMethod.CASH else "110201")
         lines = [
             {"account_code": "5201", "debit": round(tot_gross + tot_gosi_comp, 2), "credit": 0.0, "description": f"رواتب وأجور وحصة تأمينات مسير {payroll_no} ({clean_month})"},
             {"account_code": treasury_acc, "debit": 0.0, "credit": tot_net, "description": f"صرف صافي رواتب الموظفين لشهر {clean_month}"},
@@ -2013,7 +2103,8 @@ class LedgerService:
             reference=payroll_no,
             doc_type=DocumentType.PAYROLL_RUN,
             auto_post=True,
-            commit=False
+            commit=False,
+            performed_by=performed_by
         )
 
         pr = PayrollRun(
@@ -2253,7 +2344,8 @@ class LedgerService:
         db: Session,
         fiscal_year: int = 2026,
         closing_date: Optional[date] = None,
-        lock_period: bool = False
+        lock_period: bool = False,
+        performed_by: str = "مدير النظام (Admin)"
     ) -> JournalEntry:
         """توليد قيد إقفال السنة المالية (إقفال كافة حسابات الإيرادات والمصروفات في الأرباح المبقاة 3103)"""
         closing_date = closing_date or date(fiscal_year, 12, 31)
@@ -2314,7 +2406,8 @@ class LedgerService:
             reference=f"CLOSE-{fiscal_year}",
             doc_type=DocumentType.CLOSING_ENTRY,
             auto_post=True,
-            commit=False
+            commit=False,
+            performed_by=performed_by
         )
 
         if lock_period:
@@ -2666,11 +2759,13 @@ class LedgerService:
         cls,
         db: Session,
         party_type: str,
-        party_id: int
+        party_id: int,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None
     ) -> Dict[str, Any]:
         """
         استخراج كشف حساب العميل أو المورد بمطابقة تامة 100% مع الأستاذ العام (110301 / 210101)
-        بحيث يشمل الفواتير والسندات والإشعارات والأرصدة الافتتاحية وقيود التسوية والقيود العكسية.
+        بحيث يشمل الفواتير والسندات والإشعارات والأرصدة الافتتاحية وقيود التسوية والقيود العكسية، مع دعم الفلترة بالتاريخ.
         """
         movements = []
         if party_type == "CUSTOMER":
@@ -2681,7 +2776,6 @@ class LedgerService:
             ar_acc = db.query(Account).filter(Account.code == "110301").first()
 
             if ar_acc:
-                # جمع كافة القيود غير المسودة على حساب العملاء 110301 المرتبطة بهذا العميل
                 inv_je_ids = {
                     i.journal_entry_id for i in db.query(SalesInvoice).filter(
                         (SalesInvoice.customer_id == cust.id) |
@@ -2730,7 +2824,6 @@ class LedgerService:
                             "notes": jl.description or je.description
                         })
 
-            # إضافة الفواتير النقدية/البنكية للعرض التاريخي فقط (مدين = دائن، الأثر على الذمم = 0)
             cash_invs = db.query(SalesInvoice).filter(
                 SalesInvoice.payment_method != PaymentMethod.CREDIT,
                 (SalesInvoice.customer_id == cust.id) |
@@ -2822,20 +2915,41 @@ class LedgerService:
 
         movements.sort(key=lambda x: x["date"])
         running = 0.0
+        opening_bal = 0.0
         rows = []
         total_d = 0.0
         total_c = 0.0
+
         for m in movements:
+            m_dt = m["date"]
+            if end_date and m_dt > end_date:
+                continue
             d = round(float(m["debit"]), 2)
             c = round(float(m["credit"]), 2)
+            delta = (d - c) if party_type == "CUSTOMER" else (c - d)
+            if start_date and m_dt < start_date:
+                opening_bal = round(opening_bal + delta, 2)
+                running = opening_bal
+                continue
+
+            if start_date and not rows and abs(opening_bal) > 0.001:
+                op_d = opening_bal if (party_type == "CUSTOMER" and opening_bal > 0) or (party_type != "CUSTOMER" and opening_bal < 0) else 0.0
+                op_c = abs(opening_bal) if op_d == 0.0 else 0.0
+                rows.append({
+                    "التاريخ": start_date.strftime("%Y-%m-%d"),
+                    "رقم المستند": "OPENING",
+                    "نوع العملية": "رصيد أول الفترة المرحلة",
+                    "مدين (Debit)": round(op_d, 2),
+                    "دائن (Credit)": round(op_c, 2),
+                    "الرصيد التراكمي": round(opening_bal, 2),
+                    "البيان": f"رصيد مرحل ما قبل تاريخ {start_date.strftime('%Y-%m-%d')}"
+                })
+
             total_d += d
             total_c += c
-            if party_type == "CUSTOMER":
-                running += (d - c)
-            else:
-                running += (c - d)
+            running = round(running + delta, 2)
             rows.append({
-                "التاريخ": m["date"].strftime("%Y-%m-%d"),
+                "التاريخ": m_dt.strftime("%Y-%m-%d"),
                 "رقم المستند": m["doc_no"],
                 "نوع العملية": m["type"],
                 "مدين (Debit)": d,
@@ -2844,9 +2958,23 @@ class LedgerService:
                 "البيان": m["notes"]
             })
 
+        if start_date and not rows and abs(opening_bal) > 0.001:
+            op_d = opening_bal if (party_type == "CUSTOMER" and opening_bal > 0) or (party_type != "CUSTOMER" and opening_bal < 0) else 0.0
+            op_c = abs(opening_bal) if op_d == 0.0 else 0.0
+            rows.append({
+                "التاريخ": start_date.strftime("%Y-%m-%d"),
+                "رقم المستند": "OPENING",
+                "نوع العملية": "رصيد أول الفترة المرحلة",
+                "مدين (Debit)": round(op_d, 2),
+                "دائن (Credit)": round(op_c, 2),
+                "الرصيد التراكمي": round(opening_bal, 2),
+                "البيان": f"رصيد مرحل ما قبل تاريخ {start_date.strftime('%Y-%m-%d')}"
+            })
+
         return {
             "party_name": party_name,
             "party_type": party_type,
+            "opening_balance": round(opening_bal, 2),
             "total_debit": round(total_d, 2),
             "total_credit": round(total_c, 2),
             "net_balance": round(running, 2),
