@@ -4,8 +4,164 @@ MizanPro - Enterprise Financial, Inventory (WAC), Treasury, Fixed Assets, Payrol
 التطبيق الرئيسي الشامل لكافة المحركات المحاسبية والمخزنية والرقابية وباقة مكاتب المراجعة المعتمدة
 """
 
+import importlib.util
 import io
 import os
+import select
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+
+
+def _ensure_dependencies_installed() -> None:
+    """Ensure required packages from requirements.txt are installed even after a fresh container cold start."""
+    if importlib.util.find_spec("streamlit") is not None and importlib.util.find_spec("openpyxl") is not None:
+        return
+    if importlib.util.find_spec("pip") is None:
+        get_pip_path = "/tmp/get-pip.py"
+        urllib.request.urlretrieve("https://bootstrap.pypa.io/get-pip.py", get_pip_path)
+        subprocess.run([sys.executable, get_pip_path], check=False)
+    req_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
+    if os.path.exists(req_file):
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", req_file], check=False)
+
+
+def _run_streamlit_server_with_proxy() -> None:
+    """Bind port 3000 immediately and proxy HTTP/WebSocket traffic to the local Streamlit worker."""
+    port = int(os.environ.get("PORT", "3000"))
+    internal_port = int(os.environ.get("STREAMLIT_INTERNAL_PORT", "8501"))
+
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind(("0.0.0.0", port))
+    server_sock.listen(128)
+
+    _ensure_dependencies_installed()
+
+    env = os.environ.copy()
+    env["_MIZAN_STREAMLIT_WORKER"] = "1"
+    env["BROWSER_GATHER_USAGE_STATS"] = "false"
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        os.path.abspath(__file__),
+        "--server.port",
+        str(internal_port),
+        "--server.address",
+        "127.0.0.1",
+        "--server.headless",
+        "true",
+        "--browser.gatherUsageStats",
+        "false",
+        "--server.enableCORS",
+        "false",
+        "--server.enableXsrfProtection",
+        "false",
+    ]
+    worker_proc = subprocess.Popen(cmd, env=env)
+
+    def _shutdown(signum, frame):
+        try:
+            server_sock.close()
+        except OSError:
+            pass
+        if worker_proc.poll() is None:
+            worker_proc.terminate()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    def _pipe(src: socket.socket, dst: socket.socket) -> None:
+        try:
+            while True:
+                data = src.recv(65536)
+                if not data:
+                    break
+                dst.sendall(data)
+        except OSError:
+            pass
+        finally:
+            try:
+                dst.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    def _handle_client(client_sock: socket.socket) -> None:
+        upstream_sock = None
+        try:
+            ready, _, _ = select.select([client_sock], [], [], 5.0)
+            if not ready:
+                return
+            first_chunk = client_sock.recv(65536)
+            if not first_chunk:
+                return
+
+            deadline = time.monotonic() + 30.0
+            while True:
+                try:
+                    upstream_sock = socket.create_connection(("127.0.0.1", internal_port), timeout=2.0)
+                    upstream_sock.settimeout(None)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline or worker_proc.poll() is not None:
+                        return
+                    time.sleep(0.1)
+
+            upstream_sock.sendall(first_chunk)
+            t_up = threading.Thread(target=_pipe, args=(client_sock, upstream_sock), daemon=True)
+            t_down = threading.Thread(target=_pipe, args=(upstream_sock, client_sock), daemon=True)
+            t_up.start()
+            t_down.start()
+            t_up.join()
+            t_down.join()
+        except OSError:
+            pass
+        finally:
+            try:
+                client_sock.close()
+            except OSError:
+                pass
+            if upstream_sock is not None:
+                try:
+                    upstream_sock.close()
+                except OSError:
+                    pass
+
+    try:
+        while worker_proc.poll() is None:
+            ready, _, _ = select.select([server_sock], [], [], 0.5)
+            if not ready:
+                continue
+            try:
+                client_sock, _ = server_sock.accept()
+                threading.Thread(target=_handle_client, args=(client_sock,), daemon=True).start()
+            except OSError:
+                break
+    finally:
+        try:
+            server_sock.close()
+        except OSError:
+            pass
+        if worker_proc.poll() is None:
+            worker_proc.terminate()
+            try:
+                worker_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                worker_proc.kill()
+        sys.exit(worker_proc.returncode or 0)
+
+
+if __name__ == "__main__" and os.environ.get("_MIZAN_STREAMLIT_WORKER") != "1":
+    _run_streamlit_server_with_proxy()
+
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
